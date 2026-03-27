@@ -661,12 +661,16 @@ async function startHttpServer(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  await bootstrapIfNeeded();
-  loadAllSpecs();
-
   if (process.env.PORT) {
+    // Start HTTP server immediately so the health check passes,
+    // then bootstrap and load specs in the background.
     await startHttpServer();
+    bootstrapIfNeeded().then(() => loadAllSpecs()).catch((err) => {
+      console.error("[bootstrap] unexpected error:", err);
+    });
   } else {
+    await bootstrapIfNeeded();
+    loadAllSpecs();
     const transport = new StdioServerTransport();
     await createMcpServer().connect(transport);
   }
