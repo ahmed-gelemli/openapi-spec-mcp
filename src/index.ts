@@ -204,6 +204,7 @@ function toolSearchEndpoints(query: string, service?: string): unknown[] {
             path,
             operationId: op.operationId ?? "",
             summary: op.summary ?? "",
+            description: op.description ?? "",
             tags: (op.tags as string[]) ?? [],
           });
         }
