@@ -23,6 +23,7 @@ COPY update_specs.py ./
 # api/ is a persistent volume mount point — pre-create so ownership is correct
 RUN mkdir -p /app/api
 
+ENV PORT=3000
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s \
