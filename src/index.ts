@@ -369,12 +369,13 @@ function toolRefreshSpecs(): Promise<unknown> {
 // Server setup
 // ---------------------------------------------------------------------------
 
-const server = new Server(
-  { name: "openapi-spec-serve", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+function createMcpServer(): Server {
+  const server = new Server(
+    { name: "openapi-spec-serve", version: "1.0.0" },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "list_services",
@@ -524,7 +525,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   return {
     content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
   };
-});
+  });
+
+  return server;
+}
 
 // ---------------------------------------------------------------------------
 // Bootstrap: download specs if api/ dir is empty
@@ -536,8 +540,8 @@ async function bootstrapIfNeeded(): Promise<void> {
   if (!hasFiles && existsSync(UPDATE_SCRIPT)) {
     console.error("[bootstrap] No spec files found, running update_specs.py…");
     await new Promise<void>((resolve) => {
-      execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: 120_000 }, (err, _stdout, stderr) => {
-        if (err) console.error("[bootstrap] update failed:", stderr || err.message);
+      execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: 120_000 }, (err, stdout, stderr) => {
+        if (err) console.error("[bootstrap] update failed:\n", stderr || stdout || err.message);
         else console.error("[bootstrap] specs downloaded.");
         resolve();
       });
@@ -594,7 +598,7 @@ async function startHttpServer(): Promise<void> {
         if (sessionId && transports.has(sessionId)) {
           transport = transports.get(sessionId)!;
         } else if (!sessionId) {
-          // New session
+          // New session — fresh Server instance per connection
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (id) => { transports.set(id, transport); },
@@ -602,7 +606,7 @@ async function startHttpServer(): Promise<void> {
           transport.onclose = () => {
             if (transport.sessionId) transports.delete(transport.sessionId);
           };
-          await server.connect(transport);
+          await createMcpServer().connect(transport);
         } else {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Unknown session ID" }));
@@ -664,7 +668,7 @@ async function main() {
     await startHttpServer();
   } else {
     const transport = new StdioServerTransport();
-    await server.connect(transport);
+    await createMcpServer().connect(transport);
   }
 }
 
