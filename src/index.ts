@@ -6,7 +6,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
+  ErrorCode,
   ListToolsRequestSchema,
+  McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "child_process";
 import { readFileSync, readdirSync, existsSync, mkdirSync } from "fs";
@@ -20,6 +22,15 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, "..");
 const API_DIR = join(PROJECT_ROOT, "api");
 const UPDATE_SCRIPT = join(PROJECT_ROOT, "update_specs.py");
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+function log(msg: string, ...args: unknown[]) {
+  const ts = new Date().toISOString();
+  console.error(`[${ts}] ${msg}`, ...args);
+}
 
 // ---------------------------------------------------------------------------
 // Spec loading + in-memory cache
@@ -105,20 +116,22 @@ function getPaths(spec: OpenApiSpec): Record<string, Record<string, unknown>> {
 }
 
 // ---------------------------------------------------------------------------
-// Tool implementations
+// Tool implementations — throw Error for user-facing failures so the handler
+// can return isError: true. Never return { error: "..." } objects.
 // ---------------------------------------------------------------------------
 
+function requireService(service: string): OpenApiSpec {
+  const spec = loadSpec(service);
+  if (!spec) throw new Error(`Service '${service}' not found. Available: ${getServices().join(", ") || "none — run refresh_specs"}`);
+  return spec;
+}
+
 function toolListServices(): string[] {
-  const services = getServices();
-  if (services.length === 0) {
-    return ["No spec files found. Run refresh_specs to download them."] as string[];
-  }
-  return services;
+  return getServices();
 }
 
 function toolGetServiceInfo(service: string): unknown {
-  const spec = loadSpec(service);
-  if (!spec) return { error: `Service '${service}' not found. Available: ${getServices().join(", ")}` };
+  const spec = requireService(service);
 
   const info = (spec.info as Record<string, unknown>) ?? {};
   const tags = ((spec.tags as unknown[]) ?? []).map((t) => {
@@ -149,8 +162,7 @@ function toolGetServiceInfo(service: string): unknown {
 }
 
 function toolListEndpoints(service: string, method?: string, tag?: string): unknown {
-  const spec = loadSpec(service);
-  if (!spec) return { error: `Service '${service}' not found. Available: ${getServices().join(", ")}` };
+  const spec = requireService(service);
 
   const results: unknown[] = [];
   for (const [path, pathItem] of Object.entries(getPaths(spec))) {
@@ -218,15 +230,14 @@ function toolSearchEndpoints(query: string, service?: string): unknown[] {
 }
 
 function toolGetEndpoint(service: string, path: string, method: string): unknown {
-  const spec = loadSpec(service);
-  if (!spec) return { error: `Service '${service}' not found` };
+  const spec = requireService(service);
 
   const paths = getPaths(spec);
   const pathItem = paths[path];
-  if (!pathItem) return { error: `Path '${path}' not found in service '${service}'` };
+  if (!pathItem) throw new Error(`Path '${path}' not found in service '${service}'`);
 
   const op = pathItem[method.toLowerCase()] as Record<string, unknown> | undefined;
-  if (!op) return { error: `Method '${method}' not found for '${path}'` };
+  if (!op) throw new Error(`Method '${method.toUpperCase()}' not found for path '${path}' in service '${service}'`);
 
   // Parameters (merge path-level + operation-level)
   const rawParams = [
@@ -294,21 +305,18 @@ function toolGetEndpoint(service: string, path: string, method: string): unknown
 }
 
 function toolListSchemas(service: string): unknown {
-  const spec = loadSpec(service);
-  if (!spec) return { error: `Service '${service}' not found` };
+  const spec = requireService(service);
   return Object.keys(getSchemas(spec)).sort();
 }
 
 function toolGetSchema(service: string, schemaName: string): unknown {
-  const spec = loadSpec(service);
-  if (!spec) return { error: `Service '${service}' not found` };
+  const spec = requireService(service);
 
   const schemas = getSchemas(spec);
   let name = schemaName;
   if (!(name in schemas)) {
-    // Case-insensitive fallback
     const match = Object.keys(schemas).find((k) => k.toLowerCase() === schemaName.toLowerCase());
-    if (!match) return { error: `Schema '${schemaName}' not found in service '${service}'` };
+    if (!match) throw new Error(`Schema '${schemaName}' not found in service '${service}'`);
     name = match;
   }
 
@@ -348,11 +356,10 @@ function toolSearchSchemas(query: string, service?: string): unknown[] {
 
 function toolRefreshSpecs(): Promise<unknown> {
   return new Promise((resolve) => {
-    // Clear cache so refreshed files are reloaded
     specCache.clear();
 
     if (!existsSync(UPDATE_SCRIPT)) {
-      resolve({ error: `Update script not found at ${UPDATE_SCRIPT}` });
+      resolve({ success: false, errors: `Update script not found at ${UPDATE_SCRIPT}` });
       return;
     }
 
@@ -379,155 +386,172 @@ function createMcpServer(): Server {
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "list_services",
-      description: "List all available OpenAPI services that have local spec files.",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "get_service_info",
-      description:
-        "Get an overview of a service: title, version, description, servers, tags, and counts of paths/operations/schemas.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          service: { type: "string", description: "Service name (from list_services)" },
-        },
-        required: ["service"],
+    tools: [
+      {
+        name: "list_services",
+        description: "List all available OpenAPI services that have local spec files.",
+        inputSchema: { type: "object", properties: {} },
       },
-    },
-    {
-      name: "list_endpoints",
-      description:
-        "List all endpoints for a service. Optionally filter by HTTP method or tag. Returns method, path, operationId, summary, tags.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          service: { type: "string" },
-          method: {
-            type: "string",
-            description: "Optional HTTP method filter (get, post, put, patch, delete)",
+      {
+        name: "get_service_info",
+        description:
+          "Get an overview of a service: title, version, description, servers, tags, and counts of paths/operations/schemas.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            service: { type: "string", description: "Service name (from list_services)" },
           },
-          tag: { type: "string", description: "Optional tag filter" },
+          required: ["service"],
         },
-        required: ["service"],
       },
-    },
-    {
-      name: "search_endpoints",
-      description:
-        "Search for endpoints across all services (or one service) by keyword. Searches path, method, summary, description, operationId, and tags.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Search keyword or phrase" },
-          service: { type: "string", description: "Optional: restrict search to one service" },
+      {
+        name: "list_endpoints",
+        description:
+          "List all endpoints for a service. Optionally filter by HTTP method or tag. Returns method, path, operationId, summary, tags.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            service: { type: "string", description: "Service name (from list_services)" },
+            method: {
+              type: "string",
+              description: "Optional HTTP method filter (get, post, put, patch, delete)",
+            },
+            tag: { type: "string", description: "Optional tag filter" },
+          },
+          required: ["service"],
         },
-        required: ["query"],
       },
-    },
-    {
-      name: "get_endpoint",
-      description:
-        "Get full details for a specific endpoint: parameters, request body schema, and response schemas.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          service: { type: "string" },
-          path: { type: "string", description: "API path e.g. /patients/{id}" },
-          method: { type: "string", description: "HTTP method e.g. get, post" },
+      {
+        name: "search_endpoints",
+        description:
+          "Search for endpoints across all services (or one service) by keyword. Searches path, method, summary, description, operationId, and tags.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search keyword or phrase" },
+            service: { type: "string", description: "Optional: restrict search to one service" },
+          },
+          required: ["query"],
         },
-        required: ["service", "path", "method"],
       },
-    },
-    {
-      name: "list_schemas",
-      description: "List all schema/model names defined in a service's components.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          service: { type: "string" },
+      {
+        name: "get_endpoint",
+        description:
+          "Get full details for a specific endpoint: parameters, request body schema, and response schemas.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            service: { type: "string", description: "Service name (from list_services)" },
+            path: { type: "string", description: "API path e.g. /patients/{id}" },
+            method: { type: "string", description: "HTTP method e.g. get, post" },
+          },
+          required: ["service", "path", "method"],
         },
-        required: ["service"],
       },
-    },
-    {
-      name: "get_schema",
-      description:
-        "Get the full definition of a specific schema/model from a service (with $refs resolved up to 2 levels).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          service: { type: "string" },
-          schema_name: { type: "string", description: "Schema name e.g. Patient, CreatePatientRequest" },
+      {
+        name: "list_schemas",
+        description: "List all schema/model names defined in a service's components.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            service: { type: "string", description: "Service name (from list_services)" },
+          },
+          required: ["service"],
         },
-        required: ["service", "schema_name"],
       },
-    },
-    {
-      name: "search_schemas",
-      description:
-        "Search schema/model definitions by name or description across all services (or one service).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-          service: { type: "string", description: "Optional: restrict to one service" },
+      {
+        name: "get_schema",
+        description:
+          "Get the full definition of a specific schema/model from a service (with $refs resolved up to 2 levels).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            service: { type: "string", description: "Service name (from list_services)" },
+            schema_name: { type: "string", description: "Schema name e.g. Patient, CreatePatientRequest" },
+          },
+          required: ["service", "schema_name"],
         },
-        required: ["query"],
       },
-    },
-    {
-      name: "refresh_specs",
-      description:
-        "Re-download all OpenAPI spec files from the API gateway by running the update script. Clears the in-memory cache.",
-      inputSchema: { type: "object", properties: {} },
-    },
-  ],
-}));
+      {
+        name: "search_schemas",
+        description:
+          "Search schema/model definitions by name or description across all services (or one service).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search keyword or phrase" },
+            service: { type: "string", description: "Optional: restrict search to one service" },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "refresh_specs",
+        description:
+          "Re-download all OpenAPI spec files from the API gateway by running the update script. Clears the in-memory cache.",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ],
+  }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args = {} } = request.params;
-  const a = args as Record<string, string | undefined>;
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args = {} } = request.params;
+    const a = args as Record<string, string | undefined>;
 
-  let result: unknown;
+    try {
+      let result: unknown;
 
-  switch (name) {
-    case "list_services":
-      result = toolListServices();
-      break;
-    case "get_service_info":
-      result = toolGetServiceInfo(a.service!);
-      break;
-    case "list_endpoints":
-      result = toolListEndpoints(a.service!, a.method, a.tag);
-      break;
-    case "search_endpoints":
-      result = toolSearchEndpoints(a.query!, a.service);
-      break;
-    case "get_endpoint":
-      result = toolGetEndpoint(a.service!, a.path!, a.method!);
-      break;
-    case "list_schemas":
-      result = toolListSchemas(a.service!);
-      break;
-    case "get_schema":
-      result = toolGetSchema(a.service!, a.schema_name!);
-      break;
-    case "search_schemas":
-      result = toolSearchSchemas(a.query!, a.service);
-      break;
-    case "refresh_specs":
-      result = await toolRefreshSpecs();
-      break;
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
+      switch (name) {
+        case "list_services":
+          result = toolListServices();
+          break;
+        case "get_service_info":
+          result = toolGetServiceInfo(a.service!);
+          break;
+        case "list_endpoints":
+          result = toolListEndpoints(a.service!, a.method, a.tag);
+          break;
+        case "search_endpoints":
+          result = toolSearchEndpoints(a.query!, a.service);
+          break;
+        case "get_endpoint":
+          result = toolGetEndpoint(a.service!, a.path!, a.method!);
+          break;
+        case "list_schemas":
+          result = toolListSchemas(a.service!);
+          break;
+        case "get_schema":
+          result = toolGetSchema(a.service!, a.schema_name!);
+          break;
+        case "search_schemas":
+          result = toolSearchSchemas(a.query!, a.service);
+          break;
+        case "refresh_specs":
+          result = await toolRefreshSpecs();
+          break;
+        default:
+          throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+      }
 
-  return {
-    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-  };
+      let text: string;
+      try {
+        text = JSON.stringify(result, null, 2);
+      } catch {
+        text = JSON.stringify({ error: "Result could not be serialized" });
+      }
+
+      return { content: [{ type: "text", text }] };
+    } catch (e) {
+      // Re-throw MCP protocol errors (unknown tool, etc.) — SDK handles these
+      if (e instanceof McpError) throw e;
+      // User-facing tool errors: report via isError so the LLM sees the failure
+      const message = e instanceof Error ? e.message : String(e);
+      log(`Tool '${name}' error: ${message}`);
+      return {
+        content: [{ type: "text", text: message }],
+        isError: true,
+      };
+    }
   });
 
   return server;
@@ -564,151 +588,185 @@ async function bootstrapIfNeeded(): Promise<void> {
 
 const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
+const BODY_SIZE_LIMIT = 1024 * 1024; // 1 MB
+
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
+};
 
 function isAuthorized(req: IncomingMessage): boolean {
   if (!AUTH_TOKEN) return true;
   return req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
 }
 
-function log(msg: string, ...args: unknown[]) {
-  const ts = new Date().toISOString();
-  console.error(`[${ts}] ${msg}`, ...args);
-}
-
 async function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
+    let totalBytes = 0;
+    req.on("data", (c: Buffer) => {
+      totalBytes += c.length;
+      if (totalBytes > BODY_SIZE_LIMIT) {
+        reject(new Error(`Request body exceeds ${BODY_SIZE_LIMIT} bytes`));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
 }
 
 async function startHttpServer(): Promise<void> {
-  // One transport per session; keyed by session ID.
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
-  const CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
-  };
-
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // Apply CORS headers to every response so browsers can always read the body
+    for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+
     const url = new URL(req.url ?? "/", "http://localhost");
     log(`${req.method} ${url.pathname} — ip=${req.socket.remoteAddress} ua=${req.headers["user-agent"] ?? "-"}`);
 
-    // CORS preflight — must respond before auth check, browsers never send auth here
-    if (req.method === "OPTIONS") {
-      res.writeHead(204, CORS_HEADERS);
-      res.end();
-      return;
-    }
-
-    // Health check (no auth required — used by Coolify health probe)
-    if (req.method === "GET" && url.pathname === "/health") {
-      const services = getServices();
-      log(`health → ok, services=${services.length} [${services.join(", ")}]`);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, services: services.length }));
-      return;
-    }
-
-    if (!isAuthorized(req)) {
-      const authHeader = req.headers.authorization;
-      log(`401 Unauthorized — auth_header_present=${!!authHeader} auth_token_set=${!!AUTH_TOKEN}`);
-      res.writeHead(401, { ...CORS_HEADERS, "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized" }));
-      return;
-    }
-
-    if (url.pathname === "/mcp") {
-      if (req.method === "POST") {
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        let transport: StreamableHTTPServerTransport;
-
-        if (sessionId && transports.has(sessionId)) {
-          log(`POST /mcp — resuming session=${sessionId}`);
-          transport = transports.get(sessionId)!;
-        } else if (!sessionId) {
-          log(`POST /mcp — new session`);
-          // New session — fresh Server instance per connection
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (id) => {
-              log(`session initialized id=${id}`);
-              transports.set(id, transport);
-            },
-          });
-          transport.onclose = () => {
-            log(`session closed id=${transport.sessionId}`);
-            if (transport.sessionId) transports.delete(transport.sessionId);
-          };
-          await createMcpServer().connect(transport);
-        } else {
-          log(`400 Unknown session id=${sessionId} — active sessions: [${[...transports.keys()].join(", ")}]`);
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Unknown session ID" }));
-          return;
-        }
-
-        const rawBody = await readBody(req);
-        let parsedBody: unknown;
-        try {
-          parsedBody = rawBody ? JSON.parse(rawBody) : undefined;
-          const method = (parsedBody as Record<string, unknown>)?.method;
-          if (method) log(`MCP method=${method} session=${sessionId ?? "new"}`);
-        } catch (e) {
-          log(`400 Invalid JSON body: ${e}`);
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Invalid JSON" }));
-          return;
-        }
-        await transport.handleRequest(req, res, parsedBody);
+    try {
+      // CORS preflight — browsers never send auth headers in OPTIONS
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
         return;
       }
 
-      if (req.method === "GET") {
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        if (!sessionId || !transports.has(sessionId)) {
-          log(`400 GET /mcp — missing or unknown session id=${sessionId}`);
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Valid mcp-session-id header required" }));
-          return;
-        }
-        log(`GET /mcp — SSE stream opened session=${sessionId}`);
-        await transports.get(sessionId)!.handleRequest(req, res);
+      // Health check — no auth required, used by Coolify health probe
+      if (req.method === "GET" && url.pathname === "/health") {
+        const services = getServices();
+        log(`health → ok, services=${services.length} [${services.join(", ")}]`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, services: services.length }));
         return;
       }
 
-      if (req.method === "DELETE") {
-        const sessionId = req.headers["mcp-session-id"] as string | undefined;
-        if (sessionId && transports.has(sessionId)) {
-          log(`DELETE /mcp — closing session=${sessionId}`);
+      if (!isAuthorized(req)) {
+        const authHeader = req.headers.authorization;
+        log(`401 Unauthorized — auth_header_present=${!!authHeader} auth_token_set=${!!AUTH_TOKEN}`);
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      if (url.pathname === "/mcp") {
+        if (req.method === "POST") {
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          let transport: StreamableHTTPServerTransport;
+
+          if (sessionId && transports.has(sessionId)) {
+            log(`POST /mcp — resuming session=${sessionId}`);
+            transport = transports.get(sessionId)!;
+          } else if (!sessionId) {
+            log(`POST /mcp — new session`);
+            transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              onsessioninitialized: (id) => {
+                log(`session initialized id=${id}`);
+                transports.set(id, transport);
+              },
+            });
+            transport.onclose = () => {
+              log(`session closed id=${transport.sessionId}`);
+              if (transport.sessionId) transports.delete(transport.sessionId);
+            };
+            await createMcpServer().connect(transport);
+          } else {
+            log(`400 Unknown session id=${sessionId} — active sessions: [${[...transports.keys()].join(", ")}]`);
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Unknown session ID" }));
+            return;
+          }
+
+          let rawBody: string;
+          try {
+            rawBody = await readBody(req);
+          } catch (e) {
+            log(`413 Body too large or read error: ${e}`);
+            res.writeHead(413, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Request body too large" }));
+            return;
+          }
+
+          let parsedBody: unknown;
+          try {
+            parsedBody = rawBody ? JSON.parse(rawBody) : undefined;
+            const method = (parsedBody as Record<string, unknown>)?.method;
+            if (method) log(`MCP method=${method} session=${sessionId ?? "new"}`);
+          } catch (e) {
+            log(`400 Invalid JSON body: ${e}`);
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON" }));
+            return;
+          }
+
+          await transport.handleRequest(req, res, parsedBody);
+          return;
+        }
+
+        if (req.method === "GET") {
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          if (!sessionId || !transports.has(sessionId)) {
+            log(`400 GET /mcp — missing or unknown session id=${sessionId}`);
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Valid mcp-session-id header required" }));
+            return;
+          }
+          log(`GET /mcp — SSE stream opened session=${sessionId}`);
           await transports.get(sessionId)!.handleRequest(req, res);
-          transports.delete(sessionId);
-        } else {
-          log(`404 DELETE /mcp — unknown session id=${sessionId}`);
-          res.writeHead(404);
-          res.end("Session not found");
+          return;
         }
+
+        if (req.method === "DELETE") {
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          if (sessionId && transports.has(sessionId)) {
+            log(`DELETE /mcp — closing session=${sessionId}`);
+            await transports.get(sessionId)!.handleRequest(req, res);
+            transports.delete(sessionId);
+          } else {
+            log(`404 DELETE /mcp — unknown session id=${sessionId}`);
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Session not found" }));
+          }
+          return;
+        }
+
+        log(`405 Method Not Allowed: ${req.method} /mcp`);
+        res.writeHead(405, { "Content-Type": "text/plain" });
+        res.end("Method Not Allowed");
         return;
       }
 
-      log(`405 Method Not Allowed: ${req.method} /mcp`);
-      res.writeHead(405);
-      res.end("Method Not Allowed");
-      return;
+      log(`404 Not Found: ${req.method} ${url.pathname}`);
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not Found");
+    } catch (err) {
+      log(`Unhandled error in request handler: ${err}`);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Internal server error" }));
+      }
     }
-
-    log(`404 Not Found: ${req.method} ${url.pathname}`);
-    res.writeHead(404);
-    res.end("Not Found");
   });
 
   await new Promise<void>((resolve) => httpServer.listen(PORT, resolve));
   log(`HTTP server listening on port ${PORT}`);
   log(`Auth: ${AUTH_TOKEN ? "enabled (MCP_AUTH_TOKEN is set)" : "DISABLED — MCP_AUTH_TOKEN not set, all requests accepted"}`);
+
+  // Graceful shutdown — Coolify/Docker sends SIGTERM on redeploy/stop
+  const shutdown = (signal: string) => {
+    log(`${signal} received, shutting down gracefully`);
+    httpServer.close(() => {
+      log(`HTTP server closed`);
+      process.exit(0);
+    });
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 // ---------------------------------------------------------------------------
@@ -717,11 +775,9 @@ async function startHttpServer(): Promise<void> {
 
 async function main() {
   if (process.env.PORT) {
-    // Start HTTP server immediately so the health check passes,
-    // then bootstrap and load specs in the background.
     await startHttpServer();
     bootstrapIfNeeded().then(() => loadAllSpecs()).catch((err) => {
-      console.error("[bootstrap] unexpected error:", err);
+      log(`[bootstrap] unexpected error: ${err}`);
     });
   } else {
     await bootstrapIfNeeded();
@@ -732,6 +788,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Server error:", err);
+  log(`Server error: ${err}`);
   process.exit(1);
 });
