@@ -588,9 +588,22 @@ async function startHttpServer(): Promise<void> {
   // One transport per session; keyed by session ID.
   const transports = new Map<string, StreamableHTTPServerTransport>();
 
+  const CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
+  };
+
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     log(`${req.method} ${url.pathname} — ip=${req.socket.remoteAddress} ua=${req.headers["user-agent"] ?? "-"}`);
+
+    // CORS preflight — must respond before auth check, browsers never send auth here
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, CORS_HEADERS);
+      res.end();
+      return;
+    }
 
     // Health check (no auth required — used by Coolify health probe)
     if (req.method === "GET" && url.pathname === "/health") {
@@ -604,7 +617,7 @@ async function startHttpServer(): Promise<void> {
     if (!isAuthorized(req)) {
       const authHeader = req.headers.authorization;
       log(`401 Unauthorized — auth_header_present=${!!authHeader} auth_token_set=${!!AUTH_TOKEN}`);
-      res.writeHead(401, { "Content-Type": "application/json" });
+      res.writeHead(401, { ...CORS_HEADERS, "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
     }
