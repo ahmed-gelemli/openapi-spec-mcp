@@ -50,7 +50,9 @@ function loadSpec(service: string): OpenApiSpec | null {
 }
 
 function loadAllSpecs(): void {
-  for (const svc of getServices()) loadSpec(svc);
+  const services = getServices();
+  for (const svc of services) loadSpec(svc);
+  log(`Loaded ${services.length} spec(s): [${services.join(", ")}]`);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,15 +540,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function bootstrapIfNeeded(): Promise<void> {
   mkdirSync(API_DIR, { recursive: true });
   const hasFiles = existsSync(API_DIR) && readdirSync(API_DIR).some((f) => f.endsWith("-openapi.json"));
-  if (!hasFiles && existsSync(UPDATE_SCRIPT)) {
-    console.error("[bootstrap] No spec files found, running update_specs.py…");
+  if (!hasFiles) {
+    if (!existsSync(UPDATE_SCRIPT)) {
+      log(`[bootstrap] No spec files and update script not found at ${UPDATE_SCRIPT} — skipping`);
+      return;
+    }
+    log(`[bootstrap] No spec files found, running update_specs.py…`);
     await new Promise<void>((resolve) => {
       execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: 120_000 }, (err, stdout, stderr) => {
-        if (err) console.error("[bootstrap] update failed:\n", stderr || stdout || err.message);
-        else console.error("[bootstrap] specs downloaded.");
+        if (err) log(`[bootstrap] update failed: ${stderr || stdout || err.message}`);
+        else log(`[bootstrap] specs downloaded successfully`);
         resolve();
       });
     });
+  } else {
+    log(`[bootstrap] Spec files already present, skipping download`);
   }
 }
 
@@ -560,6 +568,11 @@ const PORT = parseInt(process.env.PORT ?? "3000", 10);
 function isAuthorized(req: IncomingMessage): boolean {
   if (!AUTH_TOKEN) return true;
   return req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
+}
+
+function log(msg: string, ...args: unknown[]) {
+  const ts = new Date().toISOString();
+  console.error(`[${ts}] ${msg}`, ...args);
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -577,15 +590,20 @@ async function startHttpServer(): Promise<void> {
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://localhost");
+    log(`${req.method} ${url.pathname} — ip=${req.socket.remoteAddress} ua=${req.headers["user-agent"] ?? "-"}`);
 
     // Health check (no auth required — used by Coolify health probe)
     if (req.method === "GET" && url.pathname === "/health") {
+      const services = getServices();
+      log(`health → ok, services=${services.length} [${services.join(", ")}]`);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, services: getServices().length }));
+      res.end(JSON.stringify({ ok: true, services: services.length }));
       return;
     }
 
     if (!isAuthorized(req)) {
+      const authHeader = req.headers.authorization;
+      log(`401 Unauthorized — auth_header_present=${!!authHeader} auth_token_set=${!!AUTH_TOKEN}`);
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
@@ -597,25 +615,42 @@ async function startHttpServer(): Promise<void> {
         let transport: StreamableHTTPServerTransport;
 
         if (sessionId && transports.has(sessionId)) {
+          log(`POST /mcp — resuming session=${sessionId}`);
           transport = transports.get(sessionId)!;
         } else if (!sessionId) {
+          log(`POST /mcp — new session`);
           // New session — fresh Server instance per connection
           transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (id) => { transports.set(id, transport); },
+            onsessioninitialized: (id) => {
+              log(`session initialized id=${id}`);
+              transports.set(id, transport);
+            },
           });
           transport.onclose = () => {
+            log(`session closed id=${transport.sessionId}`);
             if (transport.sessionId) transports.delete(transport.sessionId);
           };
           await createMcpServer().connect(transport);
         } else {
+          log(`400 Unknown session id=${sessionId} — active sessions: [${[...transports.keys()].join(", ")}]`);
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Unknown session ID" }));
           return;
         }
 
         const rawBody = await readBody(req);
-        const parsedBody = rawBody ? JSON.parse(rawBody) : undefined;
+        let parsedBody: unknown;
+        try {
+          parsedBody = rawBody ? JSON.parse(rawBody) : undefined;
+          const method = (parsedBody as Record<string, unknown>)?.method;
+          if (method) log(`MCP method=${method} session=${sessionId ?? "new"}`);
+        } catch (e) {
+          log(`400 Invalid JSON body: ${e}`);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON" }));
+          return;
+        }
         await transport.handleRequest(req, res, parsedBody);
         return;
       }
@@ -623,10 +658,12 @@ async function startHttpServer(): Promise<void> {
       if (req.method === "GET") {
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
         if (!sessionId || !transports.has(sessionId)) {
+          log(`400 GET /mcp — missing or unknown session id=${sessionId}`);
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Valid mcp-session-id header required" }));
           return;
         }
+        log(`GET /mcp — SSE stream opened session=${sessionId}`);
         await transports.get(sessionId)!.handleRequest(req, res);
         return;
       }
@@ -634,27 +671,31 @@ async function startHttpServer(): Promise<void> {
       if (req.method === "DELETE") {
         const sessionId = req.headers["mcp-session-id"] as string | undefined;
         if (sessionId && transports.has(sessionId)) {
+          log(`DELETE /mcp — closing session=${sessionId}`);
           await transports.get(sessionId)!.handleRequest(req, res);
           transports.delete(sessionId);
         } else {
+          log(`404 DELETE /mcp — unknown session id=${sessionId}`);
           res.writeHead(404);
           res.end("Session not found");
         }
         return;
       }
 
+      log(`405 Method Not Allowed: ${req.method} /mcp`);
       res.writeHead(405);
       res.end("Method Not Allowed");
       return;
     }
 
+    log(`404 Not Found: ${req.method} ${url.pathname}`);
     res.writeHead(404);
     res.end("Not Found");
   });
 
   await new Promise<void>((resolve) => httpServer.listen(PORT, resolve));
-  console.error(`[mcp] HTTP server listening on port ${PORT}`);
-  if (!AUTH_TOKEN) console.error("[mcp] Warning: MCP_AUTH_TOKEN not set — server is unauthenticated");
+  log(`HTTP server listening on port ${PORT}`);
+  log(`Auth: ${AUTH_TOKEN ? "enabled (MCP_AUTH_TOKEN is set)" : "DISABLED — MCP_AUTH_TOKEN not set, all requests accepted"}`);
 }
 
 // ---------------------------------------------------------------------------
