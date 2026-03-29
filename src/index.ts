@@ -594,6 +594,7 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
+  "Access-Control-Expose-Headers": "mcp-session-id",
 };
 
 function isAuthorized(req: IncomingMessage): boolean {
