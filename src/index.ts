@@ -780,6 +780,10 @@ async function main() {
     bootstrapIfNeeded().then(() => loadAllSpecs()).catch((err) => {
       log(`[bootstrap] unexpected error: ${err}`);
     });
+    setInterval(() => {
+      log(`[auto-refresh] triggering scheduled spec refresh`);
+      toolRefreshSpecs().then((r) => log(`[auto-refresh] done`, JSON.stringify(r)));
+    }, 45 * 60 * 1000);
   } else {
     await bootstrapIfNeeded();
     loadAllSpecs();
