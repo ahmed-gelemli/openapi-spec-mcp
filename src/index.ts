@@ -354,6 +354,81 @@ function toolSearchSchemas(query: string, service?: string): unknown[] {
   return results;
 }
 
+async function toolCallEndpoint(
+  service: string,
+  path: string,
+  method: string,
+  pathParams?: Record<string, string>,
+  queryParams?: Record<string, string>,
+  body?: unknown,
+  headers?: Record<string, string>,
+  timeoutMs?: number
+): Promise<unknown> {
+  const gatewayUrl = process.env.GATEWAY_URL;
+  if (!gatewayUrl) throw new Error("GATEWAY_URL environment variable is not set");
+
+  requireService(service);
+
+  // Substitute path parameters
+  let resolvedPath = path;
+  if (pathParams) {
+    for (const [key, value] of Object.entries(pathParams)) {
+      resolvedPath = resolvedPath.replace(`{${key}}`, encodeURIComponent(value));
+    }
+  }
+
+  // Build URL: GATEWAY_URL/service/path
+  const base = gatewayUrl.replace(/\/$/, "");
+  let url = `${base}/${service}${resolvedPath}`;
+
+  if (queryParams && Object.keys(queryParams).length > 0) {
+    url += `?${new URLSearchParams(queryParams).toString()}`;
+  }
+
+  const requestHeaders: Record<string, string> = { ...headers };
+  const upperMethod = method.toUpperCase();
+
+  const fetchOptions: RequestInit = {
+    method: upperMethod,
+    headers: requestHeaders,
+    signal: AbortSignal.timeout(timeoutMs ?? 30_000),
+  };
+
+  if (body !== undefined && !["GET", "HEAD"].includes(upperMethod)) {
+    requestHeaders["Content-Type"] = "application/json";
+    fetchOptions.body = JSON.stringify(body);
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(url, fetchOptions);
+  } catch (e) {
+    throw new Error(`Request failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+  let responseBody: unknown;
+  if (contentType.includes("application/json")) {
+    try {
+      responseBody = await response.json();
+    } catch {
+      responseBody = await response.text();
+    }
+  } else {
+    responseBody = await response.text();
+  }
+
+  const responseHeaders: Record<string, string> = {};
+  response.headers.forEach((value, key) => { responseHeaders[key] = value; });
+
+  return {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders,
+    body: responseBody,
+  };
+}
+
 function toolRefreshSpecs(): Promise<unknown> {
   return new Promise((resolve) => {
     specCache.clear();
@@ -491,6 +566,40 @@ function createMcpServer(): Server {
           "Re-download all OpenAPI spec files from the API gateway by running the update script. Clears the in-memory cache.",
         inputSchema: { type: "object", properties: {} },
       },
+      {
+        name: "call_endpoint",
+        description:
+          "Call an API endpoint on the gateway. Uses GATEWAY_URL as the base. Pass Authorization and other credentials via headers.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            service: { type: "string", description: "Service name (from list_services)" },
+            path: { type: "string", description: "API path e.g. /patients/{id}" },
+            method: { type: "string", description: "HTTP method: get, post, put, patch, delete" },
+            path_params: {
+              type: "object",
+              description: "Path parameter values e.g. {\"id\": \"123\"}",
+              additionalProperties: { type: "string" },
+            },
+            query_params: {
+              type: "object",
+              description: "Query string parameters",
+              additionalProperties: { type: "string" },
+            },
+            body: { description: "JSON request body" },
+            headers: {
+              type: "object",
+              description: "Request headers e.g. {\"Authorization\": \"Bearer token\"}",
+              additionalProperties: { type: "string" },
+            },
+            timeout_ms: {
+              type: "number",
+              description: "Request timeout in milliseconds (default: 30000)",
+            },
+          },
+          required: ["service", "path", "method"],
+        },
+      },
     ],
   }));
 
@@ -529,6 +638,20 @@ function createMcpServer(): Server {
         case "refresh_specs":
           result = await toolRefreshSpecs();
           break;
+        case "call_endpoint": {
+          const aa = args as Record<string, unknown>;
+          result = await toolCallEndpoint(
+            aa.service as string,
+            aa.path as string,
+            aa.method as string,
+            aa.path_params as Record<string, string> | undefined,
+            aa.query_params as Record<string, string> | undefined,
+            aa.body,
+            aa.headers as Record<string, string> | undefined,
+            aa.timeout_ms as number | undefined
+          );
+          break;
+        }
         default:
           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       }
