@@ -569,32 +569,38 @@ function createMcpServer(): Server {
       {
         name: "call_endpoint",
         description:
-          "Call an API endpoint on the gateway. Uses GATEWAY_URL as the base. Pass Authorization and other credentials via headers.",
+          "Execute a real HTTP request against a gateway API endpoint. " +
+          "Use get_endpoint first to confirm the correct path, method, parameters, and body schema. " +
+          "URL is built as: GATEWAY_URL/{service}{path}. " +
+          "Responses are never cached — each call hits the live API. " +
+          "Returns {status, statusText, headers, body} where body is parsed JSON or raw text.",
         inputSchema: {
           type: "object",
           properties: {
-            service: { type: "string", description: "Service name (from list_services)" },
-            path: { type: "string", description: "API path e.g. /patients/{id}" },
-            method: { type: "string", description: "HTTP method: get, post, put, patch, delete" },
+            service: { type: "string", description: "Service name from list_services e.g. 'patients'" },
+            path: { type: "string", description: "Exact path from the spec with {param} placeholders e.g. /patients/{id}" },
+            method: { type: "string", description: "HTTP method in any case: get, post, put, patch, delete" },
             path_params: {
               type: "object",
-              description: "Path parameter values e.g. {\"id\": \"123\"}",
+              description: "Values for {param} placeholders in path. e.g. {\"id\": \"abc123\"}. Omit if path has no placeholders.",
               additionalProperties: { type: "string" },
             },
             query_params: {
               type: "object",
-              description: "Query string parameters",
+              description: "URL query string key-value pairs. e.g. {\"page\": \"1\", \"limit\": \"20\"}. All values must be strings.",
               additionalProperties: { type: "string" },
             },
-            body: { description: "JSON request body" },
+            body: {
+              description: "JSON request body for POST/PUT/PATCH. Must match the schema from get_endpoint. Omit for GET/DELETE.",
+            },
             headers: {
               type: "object",
-              description: "Request headers e.g. {\"Authorization\": \"Bearer token\"}",
+              description: "Extra request headers. Use for auth: {\"Authorization\": \"Bearer <token>\"}. Content-Type is set automatically when body is present.",
               additionalProperties: { type: "string" },
             },
             timeout_ms: {
               type: "number",
-              description: "Request timeout in milliseconds (default: 30000)",
+              description: "Request timeout ms. Default 30000. Increase for slow or long-running endpoints.",
             },
           },
           required: ["service", "path", "method"],
