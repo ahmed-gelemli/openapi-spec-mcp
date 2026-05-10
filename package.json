@@ -1,7 +1,7 @@
 {
   "name": "openapi-spec-serve",
-  "version": "0.1.0",
-  "description": "A Model Context Protocol server",
+  "version": "1.0.0",
+  "description": "MCP server that gives Claude access to your OpenAPI specs — discover services, explore endpoints, inspect schemas, and make live API calls",
   "private": true,
   "type": "module",
   "bin": {

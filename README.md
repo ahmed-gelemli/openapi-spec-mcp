@@ -1,70 +1,136 @@
-# openapi-spec-serve MCP Server
+# openapi-spec-serve
 
-A Model Context Protocol server
+An MCP (Model Context Protocol) server that gives Claude instant access to your OpenAPI specs. Point it at an API gateway, and Claude can discover services, explore endpoints, inspect schemas, and make live API calls — all from a conversation.
 
-This is a TypeScript-based MCP server that implements a simple notes system. It demonstrates core MCP concepts by providing:
+## What it does
 
-- Resources representing text notes with URIs and metadata
-- Tools for creating new notes
-- Prompts for generating summaries of notes
+The server downloads OpenAPI JSON files from your gateway, caches them locally, and exposes them through 10 MCP tools. Claude can use these to understand your API surface without you pasting schemas into chat.
 
-## Features
+**Tools provided:**
 
-### Resources
-- List and access notes via `note://` URIs
-- Each note has a title, content and metadata
-- Plain text mime type for simple content access
+| Tool | Description |
+|---|---|
+| `list_services` | List all services that have local spec files |
+| `get_service_info` | Title, version, servers, tags, endpoint/schema counts |
+| `list_endpoints` | All endpoints for a service; filter by method or tag |
+| `search_endpoints` | Keyword search across path, summary, description, operationId, tags |
+| `get_endpoint` | Full endpoint detail: parameters, request body, response schemas (refs resolved) |
+| `list_schemas` | All schema/model names from `components.schemas` |
+| `get_schema` | Full schema definition with `$ref`s inlined up to 2 levels |
+| `search_schemas` | Keyword search over schema names and descriptions |
+| `call_endpoint` | Execute a live HTTP request against the gateway and return the response |
+| `refresh_specs` | Re-download all specs and clear the in-memory cache |
 
-### Tools
-- `create_note` - Create new text notes
-  - Takes title and content as required parameters
-  - Stores note in server state
+## Architecture
 
-### Prompts
-- `summarize_notes` - Generate a summary of all stored notes
-  - Includes all note contents as embedded resources
-  - Returns structured prompt for LLM summarization
+Single TypeScript source file (`src/index.ts`) compiled to `build/index.js`. Two transport modes selected at startup:
 
-## Development
+- **stdio** (`PORT` unset) — connects via `StdioServerTransport`, used when added to Claude Desktop or Claude Code as a local MCP server
+- **HTTP** (`PORT` set) — runs a Node.js HTTP server on `PORT`, exposes `/mcp` (Streamable HTTP with session management) and `/health` (unauthenticated, for health probes); sessions tracked in-memory; CORS applied to every response
 
-Install dependencies:
+Spec files live in `api/` as `{service}-openapi.json`. `update_specs.py` (stdlib-only Python 3) handles downloads: parallel fetches, ETag/Last-Modified conditional GETs, retries with exponential backoff, and atomic file writes. The server auto-runs it on startup if `api/` is empty, and schedules a refresh every 45 minutes in HTTP mode.
+
+## Setup
+
+### Prerequisites
+
+- Node.js 20+
+- Python 3 (for spec downloads)
+
+### Install & build
+
 ```bash
 npm install
-```
-
-Build the server:
-```bash
 npm run build
 ```
 
-For development with auto-rebuild:
+### Environment variables
+
+Copy `.env.example` to `.env` and fill in your values:
+
 ```bash
-npm run watch
+cp .env.example .env
 ```
 
-## Installation
+| Variable | Required | Description |
+|---|---|---|
+| `PORT` | HTTP mode only | Enables HTTP transport; omit for stdio mode |
+| `MCP_AUTH_TOKEN` | No | Bearer token for `/mcp`; if unset, auth is disabled |
+| `GATEWAY_URL` | Yes (for downloads) | Base URL of your API gateway |
+| `OPENAPI_SERVICES` | Yes (for downloads) | Comma-separated service names to fetch |
+| `OPENAPI_URL_<SERVICE>` | No | Override fetch URL for a specific service |
+| `OPENAPI_CONCURRENCY` | No | Max parallel downloads (default: `min(8, services)`) |
+| `OPENAPI_TIMEOUT` | No | HTTP timeout in seconds (default: `20`) |
+| `OPENAPI_RETRIES` | No | Retry attempts on transient errors (default: `3`) |
 
-To use with Claude Desktop, add the server config:
+Services are fetched from `{GATEWAY_URL}/{service-name}/openapi.json` by default. Override individual URLs with `OPENAPI_URL_<SERVICE_NAME_UPPER>` (hyphens become underscores).
 
-On MacOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
+## Usage
+
+### Local (stdio) — Claude Desktop / Claude Code
+
+```bash
+npm run build && node build/index.js
+```
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "openapi-spec-serve": {
-      "command": "/path/to/openapi-spec-serve/build/index.js"
+      "command": "/absolute/path/to/openapi-spec-serve/build/index.js"
     }
   }
 }
 ```
 
-### Debugging
+Set `GATEWAY_URL` and `OPENAPI_SERVICES` in a `.env` file in the project root, or export them in your shell before launching.
 
-Since MCP servers communicate over stdio, debugging can be challenging. We recommend using the [MCP Inspector](https://github.com/modelcontextprotocol/inspector), which is available as a package script:
+### Remote (HTTP) — Docker / Coolify
 
 ```bash
-npm run inspector
+PORT=3000 MCP_AUTH_TOKEN=yourtoken GATEWAY_URL=... OPENAPI_SERVICES=... node build/index.js
 ```
 
-The Inspector will provide a URL to access debugging tools in your browser.
+Or with Docker:
+
+```bash
+docker build -t openapi-spec-serve .
+docker run -p 3000:3000 \
+  -e MCP_AUTH_TOKEN=yourtoken \
+  -e GATEWAY_URL=https://your-gateway.example.com \
+  -e OPENAPI_SERVICES=service-one,service-two \
+  openapi-spec-serve
+```
+
+The `/health` endpoint returns `{"ok": true, "services": N}` and requires no auth — suitable for Coolify or any container health probe.
+
+Configure Claude Code to connect via HTTP:
+
+```json
+{
+  "mcpServers": {
+    "openapi-spec-serve": {
+      "type": "http",
+      "url": "https://your-deployment.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer yourtoken"
+      }
+    }
+  }
+}
+```
+
+## Development
+
+```bash
+npm run watch      # compile in watch mode
+npm run inspector  # launch MCP Inspector UI for interactive debugging
+```
+
+The MCP Inspector gives you a browser UI to call tools directly against the server — useful for testing new spec sources without involving Claude.
+
+## License
+
+MIT
