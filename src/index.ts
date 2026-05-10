@@ -93,17 +93,33 @@ function inlineSchema(
   if ("$ref" in schema && typeof schema.$ref === "string") {
     return inlineSchema(spec, resolveRef(spec, schema.$ref), depth + 1, maxDepth);
   }
-  if (schema.type === "array" && schema.items && typeof schema.items === "object") {
-    return { ...schema, items: inlineSchema(spec, schema.items as Record<string, unknown>, depth + 1, maxDepth) };
+
+  const result = { ...schema };
+
+  // Inline combinator arrays (allOf / oneOf / anyOf)
+  for (const key of ["allOf", "oneOf", "anyOf"]) {
+    if (Array.isArray(result[key])) {
+      result[key] = (result[key] as Record<string, unknown>[]).map((s) =>
+        inlineSchema(spec, s, depth + 1, maxDepth)
+      );
+    }
   }
-  if (schema.type === "object" && schema.properties && typeof schema.properties === "object") {
+
+  // Inline array items (regardless of whether type:"array" is declared)
+  if (result.items && typeof result.items === "object") {
+    result.items = inlineSchema(spec, result.items as Record<string, unknown>, depth + 1, maxDepth);
+  }
+
+  // Inline object properties (regardless of whether type:"object" is declared)
+  if (result.properties && typeof result.properties === "object") {
     const props: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(schema.properties as Record<string, unknown>)) {
+    for (const [k, v] of Object.entries(result.properties as Record<string, unknown>)) {
       props[k] = inlineSchema(spec, v as Record<string, unknown>, depth + 1, maxDepth);
     }
-    return { ...schema, properties: props };
+    result.properties = props;
   }
-  return schema;
+
+  return result;
 }
 
 function getSchemas(spec: OpenApiSpec): Record<string, unknown> {
@@ -431,8 +447,6 @@ async function toolCallEndpoint(
 
 function toolRefreshSpecs(): Promise<unknown> {
   return new Promise((resolve) => {
-    specCache.clear();
-
     if (!existsSync(UPDATE_SCRIPT)) {
       resolve({ success: false, errors: `Update script not found at ${UPDATE_SCRIPT}` });
       return;
@@ -441,6 +455,7 @@ function toolRefreshSpecs(): Promise<unknown> {
     mkdirSync(API_DIR, { recursive: true });
 
     execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: 120_000 }, (err, stdout, stderr) => {
+      if (!err) specCache.clear();
       resolve({
         success: !err,
         output: stdout,
@@ -748,8 +763,22 @@ async function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
 async function startHttpServer(): Promise<void> {
   const transports = new Map<string, StreamableHTTPServerTransport>();
+  const sessionLastSeen = new Map<string, number>();
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, ts] of sessionLastSeen) {
+      if (now - ts > SESSION_TTL_MS) {
+        log(`[session-gc] evicting idle session id=${id}`);
+        transports.delete(id);
+        sessionLastSeen.delete(id);
+      }
+    }
+  }, 10 * 60 * 1000).unref();
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     // Apply CORS headers to every response so browsers can always read the body
@@ -791,6 +820,7 @@ async function startHttpServer(): Promise<void> {
           if (sessionId && transports.has(sessionId)) {
             log(`POST /mcp — resuming session=${sessionId}`);
             transport = transports.get(sessionId)!;
+            sessionLastSeen.set(sessionId, Date.now());
           } else if (!sessionId) {
             log(`POST /mcp — new session`);
             transport = new StreamableHTTPServerTransport({
@@ -798,11 +828,15 @@ async function startHttpServer(): Promise<void> {
               onsessioninitialized: (id) => {
                 log(`session initialized id=${id}`);
                 transports.set(id, transport);
+                sessionLastSeen.set(id, Date.now());
               },
             });
             transport.onclose = () => {
               log(`session closed id=${transport.sessionId}`);
-              if (transport.sessionId) transports.delete(transport.sessionId);
+              if (transport.sessionId) {
+                transports.delete(transport.sessionId);
+                sessionLastSeen.delete(transport.sessionId);
+              }
             };
             await createMcpServer().connect(transport);
           } else {
@@ -847,6 +881,7 @@ async function startHttpServer(): Promise<void> {
             return;
           }
           log(`GET /mcp — SSE stream opened session=${sessionId}`);
+          sessionLastSeen.set(sessionId, Date.now());
           await transports.get(sessionId)!.handleRequest(req, res);
           return;
         }
@@ -857,6 +892,7 @@ async function startHttpServer(): Promise<void> {
             log(`DELETE /mcp — closing session=${sessionId}`);
             await transports.get(sessionId)!.handleRequest(req, res);
             transports.delete(sessionId);
+            sessionLastSeen.delete(sessionId);
           } else {
             log(`404 DELETE /mcp — unknown session id=${sessionId}`);
             res.writeHead(404, { "Content-Type": "application/json" });
