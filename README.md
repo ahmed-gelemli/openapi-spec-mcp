@@ -1,4 +1,4 @@
-# openapi-spec-serve
+# openapi-spec-mcp
 
 An MCP (Model Context Protocol) server that gives Claude instant access to your OpenAPI specs. Point it at an API gateway, and Claude can discover services, explore endpoints, inspect schemas, and make live API calls — all from a conversation.
 
