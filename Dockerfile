@@ -18,7 +18,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --from=builder /app/build ./build
-COPY update_specs.py ./
+COPY update_specs.py update_specs_canvas.py ./
 
 # api/ is a persistent volume mount point — pre-create so ownership is correct
 RUN mkdir -p /app/api

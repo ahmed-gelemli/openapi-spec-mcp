@@ -21,7 +21,18 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // build/ is one level below the project root
 const PROJECT_ROOT = join(__dirname, "..");
 const API_DIR = join(PROJECT_ROOT, "api");
-const UPDATE_SCRIPT = join(PROJECT_ROOT, "update_specs.py");
+// Which downloader runs for this deployment: the gateway one by default, or a
+// source-specific script such as update_specs_canvas.py.
+const UPDATE_SCRIPT = join(PROJECT_ROOT, process.env.SPEC_UPDATE_SCRIPT ?? "update_specs.py");
+const UPDATE_TIMEOUT_MS = Number(process.env.SPEC_UPDATE_TIMEOUT_MS ?? 120_000);
+const REFRESH_INTERVAL_MIN = Number(process.env.REFRESH_INTERVAL_MIN ?? 45);
+
+// Upstream request shape for call_endpoint.
+// "service" (default): GATEWAY_URL/{service}{path} — one base URL fronting many services.
+// "flat": GATEWAY_URL{path} — a single API such as Canvas, where the spec files
+// are a documentation split rather than separately addressable services.
+const GATEWAY_MODE = (process.env.GATEWAY_MODE ?? "service").toLowerCase() === "flat" ? "flat" : "service";
+const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN ?? "";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -393,15 +404,19 @@ async function toolCallEndpoint(
     }
   }
 
-  // Build URL: GATEWAY_URL/service/path
+  // Build URL: GATEWAY_URL/{service}{path}, or GATEWAY_URL{path} in flat mode
   const base = gatewayUrl.replace(/\/$/, "");
-  let url = `${base}/${service}${resolvedPath}`;
+  let url = GATEWAY_MODE === "flat" ? `${base}${resolvedPath}` : `${base}/${service}${resolvedPath}`;
 
   if (queryParams && Object.keys(queryParams).length > 0) {
     url += `?${new URLSearchParams(queryParams).toString()}`;
   }
 
   const requestHeaders: Record<string, string> = { ...headers };
+  // Inject the deployment's API token unless the caller supplied its own.
+  if (API_BEARER_TOKEN && !Object.keys(requestHeaders).some((h) => h.toLowerCase() === "authorization")) {
+    requestHeaders["Authorization"] = `Bearer ${API_BEARER_TOKEN}`;
+  }
   const upperMethod = method.toUpperCase();
 
   const fetchOptions: RequestInit = {
@@ -454,7 +469,7 @@ function toolRefreshSpecs(): Promise<unknown> {
 
     mkdirSync(API_DIR, { recursive: true });
 
-    execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: 120_000 }, (err, stdout, stderr) => {
+    execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: UPDATE_TIMEOUT_MS }, (err, stdout, stderr) => {
       if (!err) specCache.clear();
       resolve({
         success: !err,
@@ -586,7 +601,10 @@ function createMcpServer(): Server {
         description:
           "Execute a real HTTP request against a gateway API endpoint. " +
           "Use get_endpoint first to confirm the correct path, method, parameters, and body schema. " +
-          "URL is built as: GATEWAY_URL/{service}{path}. " +
+          (GATEWAY_MODE === "flat"
+            ? "URL is built as: GATEWAY_URL{path} (the service name selects the spec file, not the URL). "
+            : "URL is built as: GATEWAY_URL/{service}{path}. ") +
+          (API_BEARER_TOKEN ? "Authentication is applied automatically. " : "") +
           "Responses are never cached — each call hits the live API. " +
           "Returns {status, statusText, headers, body} where body is parsed JSON or raw text.",
         inputSchema: {
@@ -713,9 +731,9 @@ async function bootstrapIfNeeded(): Promise<void> {
       log(`[bootstrap] No spec files and update script not found at ${UPDATE_SCRIPT} — skipping`);
       return;
     }
-    log(`[bootstrap] No spec files found, running update_specs.py…`);
+    log(`[bootstrap] No spec files found, running ${UPDATE_SCRIPT}…`);
     await new Promise<void>((resolve) => {
-      execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: 120_000 }, (err, stdout, stderr) => {
+      execFile("python3", [UPDATE_SCRIPT], { cwd: PROJECT_ROOT, timeout: UPDATE_TIMEOUT_MS }, (err, stdout, stderr) => {
         if (err) log(`[bootstrap] update failed: ${stderr || stdout || err.message}`);
         else log(`[bootstrap] specs downloaded successfully`);
         resolve();
@@ -945,10 +963,13 @@ async function main() {
     bootstrapIfNeeded().then(() => loadAllSpecs()).catch((err) => {
       log(`[bootstrap] unexpected error: ${err}`);
     });
-    setInterval(() => {
-      log(`[auto-refresh] triggering scheduled spec refresh`);
-      toolRefreshSpecs().then((r) => log(`[auto-refresh] done`, JSON.stringify(r)));
-    }, 45 * 60 * 1000);
+    if (REFRESH_INTERVAL_MIN > 0) {
+      log(`[auto-refresh] scheduling spec refresh every ${REFRESH_INTERVAL_MIN} min`);
+      setInterval(() => {
+        log(`[auto-refresh] triggering scheduled spec refresh`);
+        toolRefreshSpecs().then((r) => log(`[auto-refresh] done`, JSON.stringify(r)));
+      }, REFRESH_INTERVAL_MIN * 60 * 1000);
+    }
   } else {
     await bootstrapIfNeeded();
     loadAllSpecs();
