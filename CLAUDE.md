@@ -70,6 +70,7 @@ Copy `.env.example` to `.env`. Key variables:
 | `CLIENT_TOKEN_MODE` | No | `off` (default) → all callers share `API_BEARER_TOKEN`; `authorization` → each client sends its own upstream token |
 | `IDENTITY_PATH` | No | Upstream path that resolves a token to an account (default `/api/v1/users/self`) |
 | `ADMIN_TOKEN` | No | Bearer token for `GET /usage`; if unset the endpoint is disabled |
+| `LOG_TOKENS` | No | `true` records each caller's raw API token in the usage log and identity log lines |
 
 ## MCP Tools
 
@@ -92,7 +93,8 @@ With `CLIENT_TOKEN_MODE=authorization`, each MCP client configures its own upstr
 
 - **Gate**: `authorizeRequest()` resolves the token against `{GATEWAY_URL}{IDENTITY_PATH}` at connect. 401/403 refuses the connection (negative result cached 60s); an unreachable upstream fails *open* with an unverified identity, since the spec tools serve public documentation and a bad token still fails on the `call_endpoint` that uses it.
 - **Plumbing**: an `AsyncLocalStorage` (`callerStore`) wraps `/mcp` handling, carrying the token into the tool handlers. `toolCallEndpoint` precedence is: `headers.Authorization` passed to the tool → caller's token → `API_BEARER_TOKEN`.
-- **Identity**: `sha256(token)[:12]` is the stable key; the upstream account id and name are attached when resolvable. Token values are never logged or written to disk.
+- **Identity**: `sha256(token)[:12]` is the stable key; the upstream account id and name are attached when resolvable.
+- **`LOG_TOKENS`**: off by default, in which case raw tokens stay in memory only. Set `true` and every usage record and `[identity]` log line carries the caller's live upstream credential, kept for as long as the log is (forever). `/usage` still withholds them unless `?tokens=1`, so a routine rollup does not print credentials; the file always has them.
 - **Usage log**: one JSONL record per tool call in `api/usage/YYYY-MM.jsonl` — on the same persistent volume as the specs, split monthly, never pruned. `getServices()` only matches `*-openapi.json`, so the subdirectory is invisible to it.
 - **`GET /usage`**: `ADMIN_TOKEN`-gated. Default returns a per-user rollup; `?month=YYYY-MM`, `?user=<id|key>`, `?raw=1&limit=N` for records.
 

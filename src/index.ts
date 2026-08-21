@@ -45,6 +45,11 @@ const CLIENT_TOKEN_MODE =
 const IDENTITY_PATH = process.env.IDENTITY_PATH ?? "/api/v1/users/self";
 // Gates GET /usage. Unrelated to any caller's own token.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "";
+// Records each caller's raw API token in the usage log and identity log lines.
+// These are live upstream credentials kept forever on the volume: anyone with
+// the volume, the container logs, or ADMIN_TOKEN gets working accounts for
+// every caller, revoked and current alike. Off unless deliberately enabled.
+const LOG_TOKENS = (process.env.LOG_TOKENS ?? "").toLowerCase() === "true";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -59,9 +64,9 @@ function log(msg: string, ...args: unknown[]) {
 // Per-caller identity (CLIENT_TOKEN_MODE=authorization)
 // ---------------------------------------------------------------------------
 
-// A caller's token is a live upstream credential, so it is never logged or
-// stored. Callers are identified by the account the token resolves to, with a
+// Callers are identified by the account the token resolves to, with a
 // truncated SHA-256 of the token as a stable fallback when it cannot.
+// The raw token is recorded alongside that identity only when LOG_TOKENS=true.
 
 type Identity = {
   key: string;      // sha256(token)[:12] — stable across sessions, not reversible
@@ -123,7 +128,7 @@ async function resolveIdentity(token: string): Promise<Identity | null> {
       return null;
     }
     if (!response.ok) {
-      log(`[identity] ${IDENTITY_PATH} returned ${response.status} — allowing key=${key} unverified`);
+      log(`[identity] ${IDENTITY_PATH} returned ${response.status} — allowing key=${key} unverified${tokenSuffix(token)}`);
       return { key, verified: false };
     }
 
@@ -135,12 +140,17 @@ async function resolveIdentity(token: string): Promise<Identity | null> {
       verified: true,
     };
     identityCache.set(key, identity);
-    log(`[identity] key=${key} resolved to ${identity.id ?? "?"} (${identity.name ?? "unnamed"})`);
+    log(`[identity] key=${key} resolved to ${identity.id ?? "?"} (${identity.name ?? "unnamed"})${tokenSuffix(token)}`);
     return identity;
   } catch (e) {
-    log(`[identity] lookup failed (${e instanceof Error ? e.message : String(e)}) — allowing key=${key} unverified`);
+    log(`[identity] lookup failed (${e instanceof Error ? e.message : String(e)}) — allowing key=${key} unverified${tokenSuffix(token)}`);
     return { key, verified: false };
   }
+}
+
+// Appended to identity log lines; empty unless LOG_TOKENS is on.
+function tokenSuffix(token: string): string {
+  return LOG_TOKENS ? ` token=${token}` : "";
 }
 
 function describeIdentity(identity: Identity): string {
@@ -160,6 +170,7 @@ const USAGE_DIR = join(API_DIR, "usage");
 type UsageRecord = {
   ts: string;
   key: string;
+  token?: string;   // raw caller credential — only when LOG_TOKENS=true
   user?: string;
   name?: string;
   tool: string;
@@ -206,6 +217,7 @@ function readUsage(month?: string): UsageRecord[] {
 
 type UsageSummary = {
   key: string;
+  token?: string;
   user?: string;
   name?: string;
   calls: number;
@@ -217,7 +229,14 @@ type UsageSummary = {
   last_seen: string;
 };
 
-function summarizeUsage(records: UsageRecord[]): unknown {
+// Tokens live in the file but are withheld from /usage responses unless the
+// caller explicitly asks, so a routine rollup check does not paste live
+// credentials into a terminal or a shell history.
+function stripTokens<T extends { token?: string }>(rows: T[]): T[] {
+  return rows.map(({ token: _token, ...rest }) => rest as T);
+}
+
+function summarizeUsage(records: UsageRecord[], includeTokens: boolean): unknown {
   const users = new Map<string, UsageSummary>();
 
   for (const r of records) {
@@ -225,7 +244,7 @@ function summarizeUsage(records: UsageRecord[]): unknown {
     let u = users.get(id);
     if (!u) {
       u = {
-        key: r.key, user: r.user, name: r.name,
+        key: r.key, token: r.token, user: r.user, name: r.name,
         calls: 0, errors: 0, bytes: 0,
         by_tool: {}, by_status: {},
         first_seen: r.ts, last_seen: r.ts,
@@ -233,6 +252,7 @@ function summarizeUsage(records: UsageRecord[]): unknown {
       users.set(id, u);
     }
     if (r.name) u.name = r.name;
+    if (r.token) u.token = r.token;
     u.calls++;
     if (!r.ok) u.errors++;
     u.bytes += r.bytes ?? 0;
@@ -242,9 +262,12 @@ function summarizeUsage(records: UsageRecord[]): unknown {
     if (r.ts > u.last_seen) u.last_seen = r.ts;
   }
 
+  const ranked = [...users.entries()].sort((a, b) => b[1].calls - a[1].calls);
   return {
     total_calls: records.length,
-    users: Object.fromEntries([...users.entries()].sort((a, b) => b[1].calls - a[1].calls)),
+    users: Object.fromEntries(
+      includeTokens ? ranked : ranked.map(([id, u]) => [id, stripTokens([u])[0]])
+    ),
   };
 }
 
@@ -942,6 +965,7 @@ function createMcpServer(): Server {
       recordUsage({
         ts: new Date().toISOString(),
         key: caller.identity.key,
+        token: LOG_TOKENS && caller.token ? caller.token : undefined,
         user: caller.identity.id,
         name: caller.identity.name,
         tool: name,
@@ -967,6 +991,7 @@ function createMcpServer(): Server {
       recordUsage({
         ts: new Date().toISOString(),
         key: caller.identity.key,
+        token: LOG_TOKENS && caller.token ? caller.token : undefined,
         user: caller.identity.id,
         name: caller.identity.name,
         tool: name,
@@ -1056,7 +1081,7 @@ async function authorizeRequest(req: IncomingMessage): Promise<AuthResult> {
     return {
       ok: false, status: 401,
       message: "The upstream API rejected this token. Check that it is current and has not been revoked.",
-      reason: `token key=${tokenKey(token)} rejected upstream`,
+      reason: `token key=${tokenKey(token)} rejected upstream${tokenSuffix(token)}`,
     };
   }
 
@@ -1137,12 +1162,16 @@ async function startHttpServer(): Promise<void> {
 
         const month = url.searchParams.get("month") ?? undefined;
         const user = url.searchParams.get("user");
+        const includeTokens = url.searchParams.get("tokens") === "1";
         let records = readUsage(month);
-        if (user) records = records.filter((r) => r.user === user || r.key === user);
+        if (user) records = records.filter((r) => r.user === user || r.key === user || r.token === user);
 
         const payload = url.searchParams.get("raw")
-          ? { records: records.slice(-Number(url.searchParams.get("limit") ?? 200)) }
-          : summarizeUsage(records);
+          ? {
+              records: (includeTokens ? records : stripTokens(records))
+                .slice(-Number(url.searchParams.get("limit") ?? 200)),
+            }
+          : summarizeUsage(records, includeTokens);
 
         log(`GET /usage — ${records.length} record(s)${month ? ` month=${month}` : ""}${user ? ` user=${user}` : ""}`);
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1278,6 +1307,9 @@ async function startHttpServer(): Promise<void> {
     log(`Auth: ${AUTH_TOKEN ? "enabled (MCP_AUTH_TOKEN is set)" : "DISABLED — MCP_AUTH_TOKEN not set, all requests accepted"}`);
   }
   log(`Usage log: ${USAGE_DIR}${ADMIN_TOKEN ? " — readable at GET /usage" : " — GET /usage disabled (ADMIN_TOKEN not set)"}`);
+  if (LOG_TOKENS) {
+    log(`           LOG_TOKENS=true — raw caller API tokens are written to the usage log and kept indefinitely`);
+  }
 
   // Graceful shutdown — Coolify/Docker sends SIGTERM on redeploy/stop
   const shutdown = (signal: string) => {

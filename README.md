@@ -59,6 +59,7 @@ cp .env.example .env
 | `CLIENT_TOKEN_MODE` | No | `off` (default) or `authorization` — see [Per-user tokens](#per-user-tokens) |
 | `IDENTITY_PATH` | No | Upstream path resolving a token to an account (default `/api/v1/users/self`) |
 | `ADMIN_TOKEN` | No | Bearer token for `GET /usage`; if unset the endpoint is disabled |
+| `LOG_TOKENS` | No | `true` records callers' raw API tokens in the usage log — see [Per-user tokens](#per-user-tokens) |
 | `API_BEARER_TOKEN` | No | Token sent on `call_endpoint` when the caller supplies none |
 | `GATEWAY_URL` | Yes (for downloads) | Base URL of your API gateway |
 | `OPENAPI_SERVICES` | Yes (for downloads) | Comma-separated service names to fetch |
@@ -145,7 +146,9 @@ claude mcp add --transport http canvas https://your-deployment.example.com/mcp \
 
 At connect the token is checked against `{GATEWAY_URL}{IDENTITY_PATH}` — a rejected token is refused with a clear message rather than failing later on the first call. Everything a caller does is then attributed to the account that token belongs to.
 
-**Token values are never logged or stored.** Callers appear in logs and usage records as their upstream account id and name, with a truncated SHA-256 of the token as a stable fallback key.
+Callers appear in logs and usage records as their upstream account id and name, with a truncated SHA-256 of the token as a stable fallback key. By default the token value itself is held in memory only and never written anywhere.
+
+Setting `LOG_TOKENS=true` changes that: every usage record and identity log line then carries the caller's raw upstream credential. Those are live tokens for other people's accounts, kept as long as the log is — which is forever — so anyone with the volume, the container logs, or `ADMIN_TOKEN` holds working accounts for every caller, revoked and current alike. `/usage` still withholds them unless you pass `?tokens=1`, so a routine rollup check does not print credentials to your terminal.
 
 ### Usage stats
 
@@ -171,7 +174,7 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" https://your-deployment.example.com
 }
 ```
 
-Filters: `?month=YYYY-MM`, `?user=<account id or key>`, and `?raw=1&limit=N` for individual records.
+Filters: `?month=YYYY-MM`, `?user=<account id or key>`, and `?raw=1&limit=N` for individual records. With `LOG_TOKENS=true`, `?tokens=1` includes the stored token values and `?user=` also matches on a token.
 
 ## Development
 
