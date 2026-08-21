@@ -11,9 +11,10 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "child_process";
-import { readFileSync, readdirSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, readdirSync, existsSync, mkdirSync, appendFileSync } from "fs";
 import { createServer, IncomingMessage, ServerResponse } from "http";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
+import { AsyncLocalStorage } from "async_hooks";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -34,6 +35,17 @@ const REFRESH_INTERVAL_MIN = Number(process.env.REFRESH_INTERVAL_MIN ?? 45);
 const GATEWAY_MODE = (process.env.GATEWAY_MODE ?? "service").toLowerCase() === "flat" ? "flat" : "service";
 const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN ?? "";
 
+// Where the upstream token on a call_endpoint request comes from.
+// "off" (default): every caller shares the deployment's API_BEARER_TOKEN.
+// "authorization": each client configures its own upstream token as the MCP
+// Authorization header; it is forwarded upstream and identifies the caller.
+const CLIENT_TOKEN_MODE =
+  (process.env.CLIENT_TOKEN_MODE ?? "off").toLowerCase() === "authorization" ? "authorization" : "off";
+// Upstream endpoint used to turn a caller's token into an account identity.
+const IDENTITY_PATH = process.env.IDENTITY_PATH ?? "/api/v1/users/self";
+// Gates GET /usage. Unrelated to any caller's own token.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "";
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -41,6 +53,199 @@ const API_BEARER_TOKEN = process.env.API_BEARER_TOKEN ?? "";
 function log(msg: string, ...args: unknown[]) {
   const ts = new Date().toISOString();
   console.error(`[${ts}] ${msg}`, ...args);
+}
+
+// ---------------------------------------------------------------------------
+// Per-caller identity (CLIENT_TOKEN_MODE=authorization)
+// ---------------------------------------------------------------------------
+
+// A caller's token is a live upstream credential, so it is never logged or
+// stored. Callers are identified by the account the token resolves to, with a
+// truncated SHA-256 of the token as a stable fallback when it cannot.
+
+type Identity = {
+  key: string;      // sha256(token)[:12] — stable across sessions, not reversible
+  id?: string;      // upstream account id, when resolved
+  name?: string;    // upstream display name, when resolved
+  verified: boolean;
+};
+
+type CallerContext = { token: string; identity: Identity };
+
+// Used in stdio mode and whenever CLIENT_TOKEN_MODE is off: no per-caller
+// token, so call_endpoint falls back to API_BEARER_TOKEN.
+const ANONYMOUS: CallerContext = {
+  token: "",
+  identity: { key: "-", name: "server", verified: false },
+};
+
+// Carries the calling client's token from the HTTP layer down into the tool
+// handlers, which the MCP SDK gives no direct way to thread through.
+const callerStore = new AsyncLocalStorage<CallerContext>();
+
+function tokenKey(token: string): string {
+  return createHash("sha256").update(token).digest("hex").slice(0, 12);
+}
+
+function bearerToken(req: IncomingMessage): string {
+  const match = /^Bearer\s+(.+)$/i.exec((req.headers.authorization ?? "").trim());
+  return match ? match[1].trim() : "";
+}
+
+const identityCache = new Map<string, Identity>();
+const identityRejected = new Map<string, number>();
+const REJECT_TTL_MS = 60_000;
+
+// Returns null only when the upstream explicitly rejects the token. If the
+// upstream is unreachable we fail open with an unverified identity: the spec
+// tools serve public documentation and need no credentials, and a bad token
+// still fails on the call_endpoint that would use it.
+async function resolveIdentity(token: string): Promise<Identity | null> {
+  const key = tokenKey(token);
+
+  const cached = identityCache.get(key);
+  if (cached) return cached;
+  const rejectedAt = identityRejected.get(key);
+  if (rejectedAt !== undefined && Date.now() - rejectedAt < REJECT_TTL_MS) return null;
+
+  const gatewayUrl = process.env.GATEWAY_URL;
+  if (!gatewayUrl) return { key, verified: false };
+
+  const url = `${gatewayUrl.replace(/\/$/, "")}${IDENTITY_PATH}`;
+  try {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      identityRejected.set(key, Date.now());
+      return null;
+    }
+    if (!response.ok) {
+      log(`[identity] ${IDENTITY_PATH} returned ${response.status} — allowing key=${key} unverified`);
+      return { key, verified: false };
+    }
+
+    const body = (await response.json()) as Record<string, unknown>;
+    const identity: Identity = {
+      key,
+      id: body.id !== undefined ? String(body.id) : undefined,
+      name: (body.name ?? body.short_name ?? body.display_name) as string | undefined,
+      verified: true,
+    };
+    identityCache.set(key, identity);
+    log(`[identity] key=${key} resolved to ${identity.id ?? "?"} (${identity.name ?? "unnamed"})`);
+    return identity;
+  } catch (e) {
+    log(`[identity] lookup failed (${e instanceof Error ? e.message : String(e)}) — allowing key=${key} unverified`);
+    return { key, verified: false };
+  }
+}
+
+function describeIdentity(identity: Identity): string {
+  if (identity.id) return `${identity.id}${identity.name ? ` (${identity.name})` : ""}`;
+  return identity.key;
+}
+
+// ---------------------------------------------------------------------------
+// Usage log — one JSONL record per tool call, split by month, never pruned
+// ---------------------------------------------------------------------------
+
+// Lives inside API_DIR so it lands on the same persistent volume as the specs
+// and survives redeploys. getServices() only matches *-openapi.json, so this
+// subdirectory is invisible to it.
+const USAGE_DIR = join(API_DIR, "usage");
+
+type UsageRecord = {
+  ts: string;
+  key: string;
+  user?: string;
+  name?: string;
+  tool: string;
+  ok: boolean;
+  ms: number;
+  bytes?: number;
+  method?: string;
+  path?: string;
+  query?: Record<string, string>;
+  status?: number;
+  error?: string;
+};
+
+function recordUsage(record: UsageRecord): void {
+  try {
+    mkdirSync(USAGE_DIR, { recursive: true });
+    appendFileSync(join(USAGE_DIR, `${record.ts.slice(0, 7)}.jsonl`), `${JSON.stringify(record)}\n`);
+  } catch (e) {
+    // Accounting must never break the tool call it is accounting for
+    log(`[usage] could not write record: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+function readUsage(month?: string): UsageRecord[] {
+  if (!existsSync(USAGE_DIR)) return [];
+  const files = readdirSync(USAGE_DIR)
+    .filter((f) => f.endsWith(".jsonl"))
+    .filter((f) => !month || f === `${month}.jsonl`)
+    .sort();
+
+  const records: UsageRecord[] = [];
+  for (const file of files) {
+    for (const line of readFileSync(join(USAGE_DIR, file), "utf-8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        records.push(JSON.parse(line) as UsageRecord);
+      } catch {
+        // A torn final line from an interrupted write — skip it
+      }
+    }
+  }
+  return records;
+}
+
+type UsageSummary = {
+  key: string;
+  user?: string;
+  name?: string;
+  calls: number;
+  errors: number;
+  bytes: number;
+  by_tool: Record<string, number>;
+  by_status: Record<string, number>;
+  first_seen: string;
+  last_seen: string;
+};
+
+function summarizeUsage(records: UsageRecord[]): unknown {
+  const users = new Map<string, UsageSummary>();
+
+  for (const r of records) {
+    const id = r.user ?? r.key;
+    let u = users.get(id);
+    if (!u) {
+      u = {
+        key: r.key, user: r.user, name: r.name,
+        calls: 0, errors: 0, bytes: 0,
+        by_tool: {}, by_status: {},
+        first_seen: r.ts, last_seen: r.ts,
+      };
+      users.set(id, u);
+    }
+    if (r.name) u.name = r.name;
+    u.calls++;
+    if (!r.ok) u.errors++;
+    u.bytes += r.bytes ?? 0;
+    u.by_tool[r.tool] = (u.by_tool[r.tool] ?? 0) + 1;
+    if (r.status !== undefined) u.by_status[String(r.status)] = (u.by_status[String(r.status)] ?? 0) + 1;
+    if (r.ts < u.first_seen) u.first_seen = r.ts;
+    if (r.ts > u.last_seen) u.last_seen = r.ts;
+  }
+
+  return {
+    total_calls: records.length,
+    users: Object.fromEntries([...users.entries()].sort((a, b) => b[1].calls - a[1].calls)),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -413,9 +618,18 @@ async function toolCallEndpoint(
   }
 
   const requestHeaders: Record<string, string> = { ...headers };
-  // Inject the deployment's API token unless the caller supplied its own.
-  if (API_BEARER_TOKEN && !Object.keys(requestHeaders).some((h) => h.toLowerCase() === "authorization")) {
-    requestHeaders["Authorization"] = `Bearer ${API_BEARER_TOKEN}`;
+  // Token precedence: an Authorization header passed to this tool wins, then the
+  // token the MCP client authenticated with, then the deployment-wide fallback.
+  if (!Object.keys(requestHeaders).some((h) => h.toLowerCase() === "authorization")) {
+    const token = callerStore.getStore()?.token || API_BEARER_TOKEN;
+    if (token) {
+      requestHeaders["Authorization"] = `Bearer ${token}`;
+    } else if (CLIENT_TOKEN_MODE === "authorization") {
+      throw new Error(
+        "No API token available for this request. This server forwards the token you " +
+        "configured on the MCP connection, so add it as an 'Authorization: Bearer <token>' header."
+      );
+    }
   }
   const upperMethod = method.toUpperCase();
 
@@ -483,6 +697,17 @@ function toolRefreshSpecs(): Promise<unknown> {
 // ---------------------------------------------------------------------------
 // Server setup
 // ---------------------------------------------------------------------------
+
+// The parts of a tool call worth keeping in the usage log. Only call_endpoint
+// touches the upstream API, so only it contributes request detail.
+function callDetails(name: string, args: Record<string, unknown>) {
+  if (name !== "call_endpoint") return {};
+  return {
+    method: args.method ? String(args.method).toUpperCase() : undefined,
+    path: args.path as string | undefined,
+    query: args.query_params as Record<string, string> | undefined,
+  };
+}
 
 function createMcpServer(): Server {
   const server = new Server(
@@ -604,7 +829,11 @@ function createMcpServer(): Server {
           (GATEWAY_MODE === "flat"
             ? "URL is built as: GATEWAY_URL{path} (the service name selects the spec file, not the URL). "
             : "URL is built as: GATEWAY_URL/{service}{path}. ") +
-          (API_BEARER_TOKEN ? "Authentication is applied automatically. " : "") +
+          (CLIENT_TOKEN_MODE === "authorization"
+            ? "Authentication uses the API token this MCP connection was configured with, applied automatically. "
+            : API_BEARER_TOKEN
+              ? "Authentication is applied automatically. "
+              : "") +
           "Responses are never cached — each call hits the live API. " +
           "Returns {status, statusText, headers, body} where body is parsed JSON or raw text.",
         inputSchema: {
@@ -645,6 +874,8 @@ function createMcpServer(): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
     const a = args as Record<string, string | undefined>;
+    const started = Date.now();
+    const caller = callerStore.getStore() ?? ANONYMOUS;
 
     try {
       let result: unknown;
@@ -702,13 +933,48 @@ function createMcpServer(): Server {
         text = JSON.stringify({ error: "Result could not be serialized" });
       }
 
+      const upstreamStatus =
+        name === "call_endpoint" && result && typeof result === "object"
+          ? (result as { status?: number }).status
+          : undefined;
+      const ms = Date.now() - started;
+
+      recordUsage({
+        ts: new Date().toISOString(),
+        key: caller.identity.key,
+        user: caller.identity.id,
+        name: caller.identity.name,
+        tool: name,
+        ok: true,
+        ms,
+        bytes: text.length,
+        ...callDetails(name, args as Record<string, unknown>),
+        status: upstreamStatus,
+      });
+      log(
+        `tool=${name} user=${describeIdentity(caller.identity)}` +
+        (upstreamStatus !== undefined ? ` status=${upstreamStatus}` : "") +
+        ` ms=${ms} bytes=${text.length}`
+      );
+
       return { content: [{ type: "text", text }] };
     } catch (e) {
       // Re-throw MCP protocol errors (unknown tool, etc.) — SDK handles these
       if (e instanceof McpError) throw e;
       // User-facing tool errors: report via isError so the LLM sees the failure
       const message = e instanceof Error ? e.message : String(e);
-      log(`Tool '${name}' error: ${message}`);
+      log(`Tool '${name}' error (user=${describeIdentity(caller.identity)}): ${message}`);
+      recordUsage({
+        ts: new Date().toISOString(),
+        key: caller.identity.key,
+        user: caller.identity.id,
+        name: caller.identity.name,
+        tool: name,
+        ok: false,
+        ms: Date.now() - started,
+        ...callDetails(name, args as Record<string, unknown>),
+        error: message,
+      });
       return {
         content: [{ type: "text", text: message }],
         isError: true,
@@ -759,9 +1025,42 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Expose-Headers": "mcp-session-id",
 };
 
-function isAuthorized(req: IncomingMessage): boolean {
-  if (!AUTH_TOKEN) return true;
-  return req.headers.authorization === `Bearer ${AUTH_TOKEN}`;
+type AuthResult =
+  | { ok: true; context: CallerContext }
+  | { ok: false; status: number; message: string; reason: string };
+
+// In "off" mode the Authorization header carries a shared gate token.
+// In "authorization" mode it carries the caller's own upstream API token, and
+// the upstream itself decides whether that token is valid.
+async function authorizeRequest(req: IncomingMessage): Promise<AuthResult> {
+  if (CLIENT_TOKEN_MODE !== "authorization") {
+    if (!AUTH_TOKEN) return { ok: true, context: ANONYMOUS };
+    if (req.headers.authorization === `Bearer ${AUTH_TOKEN}`) return { ok: true, context: ANONYMOUS };
+    return {
+      ok: false, status: 401, message: "Unauthorized",
+      reason: `auth_header_present=${!!req.headers.authorization} auth_token_set=${!!AUTH_TOKEN}`,
+    };
+  }
+
+  const token = bearerToken(req);
+  if (!token) {
+    return {
+      ok: false, status: 401,
+      message: "Send your own API token as 'Authorization: Bearer <token>' — this server has no shared token.",
+      reason: "no bearer token supplied",
+    };
+  }
+
+  const identity = await resolveIdentity(token);
+  if (!identity) {
+    return {
+      ok: false, status: 401,
+      message: "The upstream API rejected this token. Check that it is current and has not been revoked.",
+      reason: `token key=${tokenKey(token)} rejected upstream`,
+    };
+  }
+
+  return { ok: true, context: { token, identity } };
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -822,106 +1121,139 @@ async function startHttpServer(): Promise<void> {
         return;
       }
 
-      if (!isAuthorized(req)) {
-        const authHeader = req.headers.authorization;
-        log(`401 Unauthorized — auth_header_present=${!!authHeader} auth_token_set=${!!AUTH_TOKEN}`);
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
+      // Usage stats — gated by ADMIN_TOKEN, never by a caller's own token
+      if (req.method === "GET" && url.pathname === "/usage") {
+        if (!ADMIN_TOKEN) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "ADMIN_TOKEN is not set — /usage is disabled" }));
+          return;
+        }
+        if (bearerToken(req) !== ADMIN_TOKEN) {
+          log(`401 /usage — bad or missing admin token`);
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+
+        const month = url.searchParams.get("month") ?? undefined;
+        const user = url.searchParams.get("user");
+        let records = readUsage(month);
+        if (user) records = records.filter((r) => r.user === user || r.key === user);
+
+        const payload = url.searchParams.get("raw")
+          ? { records: records.slice(-Number(url.searchParams.get("limit") ?? 200)) }
+          : summarizeUsage(records);
+
+        log(`GET /usage — ${records.length} record(s)${month ? ` month=${month}` : ""}${user ? ` user=${user}` : ""}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(payload, null, 2));
         return;
       }
 
+      const auth = await authorizeRequest(req);
+      if (!auth.ok) {
+        log(`${auth.status} Unauthorized — ${auth.reason}`);
+        res.writeHead(auth.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: auth.message }));
+        return;
+      }
+      const callerContext = auth.context;
+
       if (url.pathname === "/mcp") {
-        if (req.method === "POST") {
-          const sessionId = req.headers["mcp-session-id"] as string | undefined;
-          let transport: StreamableHTTPServerTransport;
+        // Every tool call for this request runs inside the caller's context
+        await callerStore.run(callerContext, async () => {
+          if (req.method === "POST") {
+            const sessionId = req.headers["mcp-session-id"] as string | undefined;
+            let transport: StreamableHTTPServerTransport;
 
-          if (sessionId && transports.has(sessionId)) {
-            log(`POST /mcp — resuming session=${sessionId}`);
-            transport = transports.get(sessionId)!;
+            if (sessionId && transports.has(sessionId)) {
+              log(`POST /mcp — resuming session=${sessionId}`);
+              transport = transports.get(sessionId)!;
+              sessionLastSeen.set(sessionId, Date.now());
+            } else if (!sessionId) {
+              log(`POST /mcp — new session`);
+              transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+                onsessioninitialized: (id) => {
+                  log(`session initialized id=${id}`);
+                  transports.set(id, transport);
+                  sessionLastSeen.set(id, Date.now());
+                },
+              });
+              transport.onclose = () => {
+                log(`session closed id=${transport.sessionId}`);
+                if (transport.sessionId) {
+                  transports.delete(transport.sessionId);
+                  sessionLastSeen.delete(transport.sessionId);
+                }
+              };
+              await createMcpServer().connect(transport);
+            } else {
+              log(`400 Unknown session id=${sessionId} — active sessions: [${[...transports.keys()].join(", ")}]`);
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Unknown session ID" }));
+              return;
+            }
+
+            let rawBody: string;
+            try {
+              rawBody = await readBody(req);
+            } catch (e) {
+              log(`413 Body too large or read error: ${e}`);
+              res.writeHead(413, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Request body too large" }));
+              return;
+            }
+
+            let parsedBody: unknown;
+            try {
+              parsedBody = rawBody ? JSON.parse(rawBody) : undefined;
+              const method = (parsedBody as Record<string, unknown>)?.method;
+              if (method) log(`MCP method=${method} session=${sessionId ?? "new"}`);
+            } catch (e) {
+              log(`400 Invalid JSON body: ${e}`);
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Invalid JSON" }));
+              return;
+            }
+
+            await transport.handleRequest(req, res, parsedBody);
+            return;
+          }
+
+          if (req.method === "GET") {
+            const sessionId = req.headers["mcp-session-id"] as string | undefined;
+            if (!sessionId || !transports.has(sessionId)) {
+              log(`400 GET /mcp — missing or unknown session id=${sessionId}`);
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Valid mcp-session-id header required" }));
+              return;
+            }
+            log(`GET /mcp — SSE stream opened session=${sessionId}`);
             sessionLastSeen.set(sessionId, Date.now());
-          } else if (!sessionId) {
-            log(`POST /mcp — new session`);
-            transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: () => randomUUID(),
-              onsessioninitialized: (id) => {
-                log(`session initialized id=${id}`);
-                transports.set(id, transport);
-                sessionLastSeen.set(id, Date.now());
-              },
-            });
-            transport.onclose = () => {
-              log(`session closed id=${transport.sessionId}`);
-              if (transport.sessionId) {
-                transports.delete(transport.sessionId);
-                sessionLastSeen.delete(transport.sessionId);
-              }
-            };
-            await createMcpServer().connect(transport);
-          } else {
-            log(`400 Unknown session id=${sessionId} — active sessions: [${[...transports.keys()].join(", ")}]`);
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Unknown session ID" }));
-            return;
-          }
-
-          let rawBody: string;
-          try {
-            rawBody = await readBody(req);
-          } catch (e) {
-            log(`413 Body too large or read error: ${e}`);
-            res.writeHead(413, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Request body too large" }));
-            return;
-          }
-
-          let parsedBody: unknown;
-          try {
-            parsedBody = rawBody ? JSON.parse(rawBody) : undefined;
-            const method = (parsedBody as Record<string, unknown>)?.method;
-            if (method) log(`MCP method=${method} session=${sessionId ?? "new"}`);
-          } catch (e) {
-            log(`400 Invalid JSON body: ${e}`);
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Invalid JSON" }));
-            return;
-          }
-
-          await transport.handleRequest(req, res, parsedBody);
-          return;
-        }
-
-        if (req.method === "GET") {
-          const sessionId = req.headers["mcp-session-id"] as string | undefined;
-          if (!sessionId || !transports.has(sessionId)) {
-            log(`400 GET /mcp — missing or unknown session id=${sessionId}`);
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Valid mcp-session-id header required" }));
-            return;
-          }
-          log(`GET /mcp — SSE stream opened session=${sessionId}`);
-          sessionLastSeen.set(sessionId, Date.now());
-          await transports.get(sessionId)!.handleRequest(req, res);
-          return;
-        }
-
-        if (req.method === "DELETE") {
-          const sessionId = req.headers["mcp-session-id"] as string | undefined;
-          if (sessionId && transports.has(sessionId)) {
-            log(`DELETE /mcp — closing session=${sessionId}`);
             await transports.get(sessionId)!.handleRequest(req, res);
-            transports.delete(sessionId);
-            sessionLastSeen.delete(sessionId);
-          } else {
-            log(`404 DELETE /mcp — unknown session id=${sessionId}`);
-            res.writeHead(404, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Session not found" }));
+            return;
           }
-          return;
-        }
 
-        log(`405 Method Not Allowed: ${req.method} /mcp`);
-        res.writeHead(405, { "Content-Type": "text/plain" });
-        res.end("Method Not Allowed");
+          if (req.method === "DELETE") {
+            const sessionId = req.headers["mcp-session-id"] as string | undefined;
+            if (sessionId && transports.has(sessionId)) {
+              log(`DELETE /mcp — closing session=${sessionId}`);
+              await transports.get(sessionId)!.handleRequest(req, res);
+              transports.delete(sessionId);
+              sessionLastSeen.delete(sessionId);
+            } else {
+              log(`404 DELETE /mcp — unknown session id=${sessionId}`);
+              res.writeHead(404, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Session not found" }));
+            }
+            return;
+          }
+
+          log(`405 Method Not Allowed: ${req.method} /mcp`);
+          res.writeHead(405, { "Content-Type": "text/plain" });
+          res.end("Method Not Allowed");
+        });
         return;
       }
 
@@ -939,7 +1271,13 @@ async function startHttpServer(): Promise<void> {
 
   await new Promise<void>((resolve) => httpServer.listen(PORT, resolve));
   log(`HTTP server listening on port ${PORT}`);
-  log(`Auth: ${AUTH_TOKEN ? "enabled (MCP_AUTH_TOKEN is set)" : "DISABLED — MCP_AUTH_TOKEN not set, all requests accepted"}`);
+  if (CLIENT_TOKEN_MODE === "authorization") {
+    log(`Auth: per-caller — each client sends its own upstream API token as 'Authorization: Bearer <token>'`);
+    log(`      tokens are verified against ${IDENTITY_PATH} and forwarded on call_endpoint; MCP_AUTH_TOKEN is ignored`);
+  } else {
+    log(`Auth: ${AUTH_TOKEN ? "enabled (MCP_AUTH_TOKEN is set)" : "DISABLED — MCP_AUTH_TOKEN not set, all requests accepted"}`);
+  }
+  log(`Usage log: ${USAGE_DIR}${ADMIN_TOKEN ? " — readable at GET /usage" : " — GET /usage disabled (ADMIN_TOKEN not set)"}`);
 
   // Graceful shutdown — Coolify/Docker sends SIGTERM on redeploy/stop
   const shutdown = (signal: string) => {

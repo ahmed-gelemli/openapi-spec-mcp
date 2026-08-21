@@ -55,7 +55,11 @@ cp .env.example .env
 | Variable | Required | Description |
 |---|---|---|
 | `PORT` | HTTP mode only | Enables HTTP transport; omit for stdio mode |
-| `MCP_AUTH_TOKEN` | No | Bearer token for `/mcp`; if unset, auth is disabled |
+| `MCP_AUTH_TOKEN` | No | Bearer token for `/mcp`; if unset, auth is disabled. Ignored when `CLIENT_TOKEN_MODE=authorization` |
+| `CLIENT_TOKEN_MODE` | No | `off` (default) or `authorization` — see [Per-user tokens](#per-user-tokens) |
+| `IDENTITY_PATH` | No | Upstream path resolving a token to an account (default `/api/v1/users/self`) |
+| `ADMIN_TOKEN` | No | Bearer token for `GET /usage`; if unset the endpoint is disabled |
+| `API_BEARER_TOKEN` | No | Token sent on `call_endpoint` when the caller supplies none |
 | `GATEWAY_URL` | Yes (for downloads) | Base URL of your API gateway |
 | `OPENAPI_SERVICES` | Yes (for downloads) | Comma-separated service names to fetch |
 | `OPENAPI_URL_<SERVICE>` | No | Override fetch URL for a specific service |
@@ -121,6 +125,53 @@ Configure Claude Code to connect via HTTP:
   }
 }
 ```
+
+### Per-user tokens
+
+By default every caller shares one upstream credential (`API_BEARER_TOKEN`) and `MCP_AUTH_TOKEN` guards the endpoint. Set `CLIENT_TOKEN_MODE=authorization` to flip that around: each person configures **their own** upstream API token on their MCP client, and the server forwards it.
+
+```bash
+CLIENT_TOKEN_MODE=authorization
+ADMIN_TOKEN=$(openssl rand -hex 32)   # for GET /usage
+# MCP_AUTH_TOKEN and API_BEARER_TOKEN are not needed in this mode
+```
+
+Each user then connects with their own token:
+
+```bash
+claude mcp add --transport http canvas https://your-deployment.example.com/mcp \
+  --header "Authorization: Bearer <their own API token>"
+```
+
+At connect the token is checked against `{GATEWAY_URL}{IDENTITY_PATH}` — a rejected token is refused with a clear message rather than failing later on the first call. Everything a caller does is then attributed to the account that token belongs to.
+
+**Token values are never logged or stored.** Callers appear in logs and usage records as their upstream account id and name, with a truncated SHA-256 of the token as a stable fallback key.
+
+### Usage stats
+
+Every tool call appends one JSONL record to `api/usage/YYYY-MM.jsonl`, on the same persistent volume as the specs. Files are split by month and never pruned.
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" https://your-deployment.example.com/usage
+```
+
+```json
+{
+  "total_calls": 418,
+  "users": {
+    "12345": {
+      "key": "31fb6cd49575", "name": "Ada L.",
+      "calls": 300, "errors": 2, "bytes": 1840221,
+      "by_tool": { "call_endpoint": 210, "search_endpoints": 90 },
+      "by_status": { "200": 205, "404": 5 },
+      "first_seen": "2026-08-21T09:02:11.004Z",
+      "last_seen": "2026-08-21T18:44:02.117Z"
+    }
+  }
+}
+```
+
+Filters: `?month=YYYY-MM`, `?user=<account id or key>`, and `?raw=1&limit=N` for individual records.
 
 ## Development
 

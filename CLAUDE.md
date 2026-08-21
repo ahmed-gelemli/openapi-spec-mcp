@@ -67,6 +67,9 @@ Copy `.env.example` to `.env`. Key variables:
 | `CANVAS_RESOURCES` | No | Comma-separated subset of Canvas resources (default: all 144) |
 | `GATEWAY_MODE` | No | `service` (default) → `GATEWAY_URL/{service}{path}`; `flat` → `GATEWAY_URL{path}` |
 | `API_BEARER_TOKEN` | No | Sent as `Authorization: Bearer` on `call_endpoint` unless the caller passes its own |
+| `CLIENT_TOKEN_MODE` | No | `off` (default) → all callers share `API_BEARER_TOKEN`; `authorization` → each client sends its own upstream token |
+| `IDENTITY_PATH` | No | Upstream path that resolves a token to an account (default `/api/v1/users/self`) |
+| `ADMIN_TOKEN` | No | Bearer token for `GET /usage`; if unset the endpoint is disabled |
 
 ## MCP Tools
 
@@ -82,6 +85,18 @@ All tools return JSON via `content: [{ type: "text", text }]`. Errors use `isErr
 - `search_schemas` — keyword search over schema names and descriptions
 - `refresh_specs` — clears cache and re-runs the configured spec updater
 - `call_endpoint` — executes a real HTTP request against the upstream API (URL shape set by `GATEWAY_MODE`)
+
+## Per-caller tokens and usage accounting
+
+With `CLIENT_TOKEN_MODE=authorization`, each MCP client configures its own upstream API token as the `Authorization` header instead of a shared `MCP_AUTH_TOKEN`.
+
+- **Gate**: `authorizeRequest()` resolves the token against `{GATEWAY_URL}{IDENTITY_PATH}` at connect. 401/403 refuses the connection (negative result cached 60s); an unreachable upstream fails *open* with an unverified identity, since the spec tools serve public documentation and a bad token still fails on the `call_endpoint` that uses it.
+- **Plumbing**: an `AsyncLocalStorage` (`callerStore`) wraps `/mcp` handling, carrying the token into the tool handlers. `toolCallEndpoint` precedence is: `headers.Authorization` passed to the tool → caller's token → `API_BEARER_TOKEN`.
+- **Identity**: `sha256(token)[:12]` is the stable key; the upstream account id and name are attached when resolvable. Token values are never logged or written to disk.
+- **Usage log**: one JSONL record per tool call in `api/usage/YYYY-MM.jsonl` — on the same persistent volume as the specs, split monthly, never pruned. `getServices()` only matches `*-openapi.json`, so the subdirectory is invisible to it.
+- **`GET /usage`**: `ADMIN_TOKEN`-gated. Default returns a per-user rollup; `?month=YYYY-MM`, `?user=<id|key>`, `?raw=1&limit=N` for records.
+
+`CLIENT_TOKEN_MODE` defaults to `off`, which is the pre-existing behavior — both deployments share one image, so the gateway app is unaffected.
 
 ## Claude Desktop / Claude Code Configuration
 
