@@ -97,24 +97,40 @@ function bearerToken(req: IncomingMessage): string {
   return match ? match[1].trim() : "";
 }
 
+const REJECTED_MESSAGE =
+  "The upstream API rejected this token. Check that it is current and has not been revoked.";
+const MISCONFIGURED_MESSAGE =
+  "This server could not verify tokens against the upstream API — its GATEWAY_URL/IDENTITY_PATH " +
+  "configuration is wrong. Connections are refused until that is fixed; contact whoever runs it.";
+
 const identityCache = new Map<string, Identity>();
 const identityRejected = new Map<string, number>();
 const REJECT_TTL_MS = 60_000;
 
-// Returns null only when the upstream explicitly rejects the token. If the
-// upstream is unreachable we fail open with an unverified identity: the spec
-// tools serve public documentation and need no credentials, and a bad token
-// still fails on the call_endpoint that would use it.
-async function resolveIdentity(token: string): Promise<Identity | null> {
+type IdentityResult =
+  | { ok: true; identity: Identity }
+  | { ok: false; reason: string; message: string };
+
+// Fails OPEN only when the upstream could not answer at all — a network error
+// or a 5xx — because the spec tools serve public documentation and need no
+// credentials, and a bad token still fails on the call_endpoint that uses it.
+// Any 4xx fails CLOSED: the upstream answered, and a 404 there means
+// IDENTITY_PATH is wrong, which must never silently disable authentication.
+async function resolveIdentity(token: string): Promise<IdentityResult> {
   const key = tokenKey(token);
 
   const cached = identityCache.get(key);
-  if (cached) return cached;
+  if (cached) return { ok: true, identity: cached };
   const rejectedAt = identityRejected.get(key);
-  if (rejectedAt !== undefined && Date.now() - rejectedAt < REJECT_TTL_MS) return null;
+  if (rejectedAt !== undefined && Date.now() - rejectedAt < REJECT_TTL_MS) {
+    return { ok: false, reason: `key=${key} rejected upstream (cached)`, message: REJECTED_MESSAGE };
+  }
 
   const gatewayUrl = process.env.GATEWAY_URL;
-  if (!gatewayUrl) return { key, verified: false };
+  if (!gatewayUrl) {
+    log(`[identity] GATEWAY_URL is not set — refusing, identity cannot be verified`);
+    return { ok: false, reason: "GATEWAY_URL not set", message: MISCONFIGURED_MESSAGE };
+  }
 
   const url = `${gatewayUrl.replace(/\/$/, "")}${IDENTITY_PATH}`;
   try {
@@ -125,11 +141,24 @@ async function resolveIdentity(token: string): Promise<Identity | null> {
 
     if (response.status === 401 || response.status === 403) {
       identityRejected.set(key, Date.now());
-      return null;
+      log(`[identity] ${IDENTITY_PATH} rejected key=${key}${tokenSuffix(token)}`);
+      return { ok: false, reason: `key=${key} rejected upstream`, message: REJECTED_MESSAGE };
+    }
+    if (response.status >= 400 && response.status < 500) {
+      // The upstream answered, so this is not an outage — most likely
+      // IDENTITY_PATH does not exist under GATEWAY_URL. Refuse rather than
+      // let a configuration mistake turn into an unauthenticated endpoint.
+      log(
+        `[identity] ${IDENTITY_PATH} returned ${response.status} — refusing. ` +
+        `Check that GATEWAY_URL + IDENTITY_PATH resolves to the identity endpoint ` +
+        `(currently ${url}).`
+      );
+      return { ok: false, reason: `identity path returned ${response.status}`, message: MISCONFIGURED_MESSAGE };
     }
     if (!response.ok) {
+      // 5xx — treat as an outage and fail open
       log(`[identity] ${IDENTITY_PATH} returned ${response.status} — allowing key=${key} unverified${tokenSuffix(token)}`);
-      return { key, verified: false };
+      return { ok: true, identity: { key, verified: false } };
     }
 
     const body = (await response.json()) as Record<string, unknown>;
@@ -141,10 +170,38 @@ async function resolveIdentity(token: string): Promise<Identity | null> {
     };
     identityCache.set(key, identity);
     log(`[identity] key=${key} resolved to ${identity.id ?? "?"} (${identity.name ?? "unnamed"})${tokenSuffix(token)}`);
-    return identity;
+    return { ok: true, identity };
   } catch (e) {
+    // Network error or timeout — the upstream never answered, so fail open
     log(`[identity] lookup failed (${e instanceof Error ? e.message : String(e)}) — allowing key=${key} unverified${tokenSuffix(token)}`);
-    return { key, verified: false };
+    return { ok: true, identity: { key, verified: false } };
+  }
+}
+
+// Probes the identity endpoint at startup with a token that cannot be valid.
+// A correctly configured endpoint answers 401/403; anything else means the
+// URL is wrong and every connection would be refused, so say so loudly here
+// rather than leaving it to be discovered one failed client at a time.
+async function checkIdentityEndpoint(): Promise<void> {
+  const gatewayUrl = process.env.GATEWAY_URL;
+  if (!gatewayUrl) {
+    log(`[identity] WARNING: CLIENT_TOKEN_MODE=authorization but GATEWAY_URL is not set — all connections will be refused`);
+    return;
+  }
+  const url = `${gatewayUrl.replace(/\/$/, "")}${IDENTITY_PATH}`;
+  try {
+    const response = await fetch(url, {
+      headers: { Authorization: "Bearer probe-not-a-real-token", Accept: "application/json" },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (response.status === 401 || response.status === 403) {
+      log(`[identity] ${url} → ${response.status}, identity endpoint looks correct`);
+    } else {
+      log(`[identity] WARNING: ${url} → ${response.status} for an invalid token; expected 401/403.`);
+      log(`[identity] WARNING: IDENTITY_PATH is probably wrong for this GATEWAY_URL — all connections will be refused.`);
+    }
+  } catch (e) {
+    log(`[identity] could not probe ${url}: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -1076,16 +1133,17 @@ async function authorizeRequest(req: IncomingMessage): Promise<AuthResult> {
     };
   }
 
-  const identity = await resolveIdentity(token);
-  if (!identity) {
+  const result = await resolveIdentity(token);
+  if (!result.ok) {
     return {
-      ok: false, status: 401,
-      message: "The upstream API rejected this token. Check that it is current and has not been revoked.",
-      reason: `token key=${tokenKey(token)} rejected upstream${tokenSuffix(token)}`,
+      ok: false,
+      status: result.message === MISCONFIGURED_MESSAGE ? 503 : 401,
+      message: result.message,
+      reason: `${result.reason}${tokenSuffix(token)}`,
     };
   }
 
-  return { ok: true, context: { token, identity } };
+  return { ok: true, context: { token, identity: result.identity } };
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {
@@ -1303,6 +1361,7 @@ async function startHttpServer(): Promise<void> {
   if (CLIENT_TOKEN_MODE === "authorization") {
     log(`Auth: per-caller — each client sends its own upstream API token as 'Authorization: Bearer <token>'`);
     log(`      tokens are verified against ${IDENTITY_PATH} and forwarded on call_endpoint; MCP_AUTH_TOKEN is ignored`);
+    void checkIdentityEndpoint();
   } else {
     log(`Auth: ${AUTH_TOKEN ? "enabled (MCP_AUTH_TOKEN is set)" : "DISABLED — MCP_AUTH_TOKEN not set, all requests accepted"}`);
   }
