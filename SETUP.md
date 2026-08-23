@@ -68,31 +68,3 @@ Tools: `list_services`, `search_endpoints`, `get_endpoint`, `list_schemas`, `get
 | A call returns `401` but tools work | Admin-only endpoint (e.g. `accounts`, `sis_imports`) | Nothing to fix — your account lacks that permission |
 
 To disconnect: delete the connector in claude.ai, and delete the token under **Approved Integrations** in Canvas. Deleting the Canvas token alone is enough to cut off access immediately.
-
----
-
-## Admin (operator only)
-
-All of these need `ADMIN_TOKEN`, set in the Dokploy env for the canvas app.
-
-```bash
-ADMIN=<admin token>
-BASE=https://mcp-canvas-openapi.ismysimpleproject.com
-
-# who is connected
-curl -H "Authorization: Bearer $ADMIN" $BASE/admin/grants
-
-# usage rollup per person
-curl -H "Authorization: Bearer $ADMIN" $BASE/usage
-
-# disconnect one person (id from the grants listing)
-curl -X DELETE -H "Authorization: Bearer $ADMIN" "$BASE/admin/grants?id=<id>"
-
-# start fresh
-curl -X DELETE -H "Authorization: Bearer $ADMIN" "$BASE/usage?confirm=1"        # wipe all usage records
-curl -X DELETE -H "Authorization: Bearer $ADMIN" "$BASE/admin/grants?all=1"     # disconnect everyone
-```
-
-`?month=YYYY-MM` scopes the usage wipe to one month. Neither reset touches the container's stdout log, which rotates away with old deployments on its own.
-
-Note: `LOG_TOKENS=true` is on, so every usage record holds the caller's live Canvas token, kept until purged. That is deliberate but worth knowing before adding people who did not agree to it.
