@@ -58,7 +58,10 @@ cp .env.example .env
 | `MCP_AUTH_TOKEN` | No | Bearer token for `/mcp`; if unset, auth is disabled. Ignored when `CLIENT_TOKEN_MODE=authorization` |
 | `CLIENT_TOKEN_MODE` | No | `off` (default) or `authorization` — see [Per-user tokens](#per-user-tokens) |
 | `IDENTITY_PATH` | No | Upstream path resolving a token to an account (default `/api/v1/users/self`) |
-| `ADMIN_TOKEN` | No | Bearer token for `GET /usage`; if unset the endpoint is disabled |
+| `ADMIN_TOKEN` | No | Bearer token for `GET /usage` and `/admin/grants`; if unset both are disabled |
+| `PUBLIC_URL` | No | Public origin used in the OAuth metadata; defaults to the `X-Forwarded-*` headers |
+| `SERVICE_LABEL` | No | Name shown on the OAuth consent page (defaults to `Canvas` when `CANVAS_URL` is set) |
+| `TOKEN_HELP_URL` | No | Where the consent page tells users to generate a token |
 | `LOG_TOKENS` | No | `true` records callers' raw API tokens in the usage log — see [Per-user tokens](#per-user-tokens) |
 | `API_BEARER_TOKEN` | No | Token sent on `call_endpoint` when the caller supplies none |
 | `GATEWAY_URL` | Yes (for downloads) | Base URL of your API gateway |
@@ -149,6 +152,26 @@ At connect the token is checked against `{GATEWAY_URL}{IDENTITY_PATH}` — a rej
 Callers appear in logs and usage records as their upstream account id and name, with a truncated SHA-256 of the token as a stable fallback key. By default the token value itself is held in memory only and never written anywhere.
 
 Setting `LOG_TOKENS=true` changes that: every usage record and identity log line then carries the caller's raw upstream credential. Those are live tokens for other people's accounts, kept as long as the log is — which is forever — so anyone with the volume, the container logs, or `ADMIN_TOKEN` holds working accounts for every caller, revoked and current alike. `/usage` still withholds them unless you pass `?tokens=1`, so a routine rollup check does not print credentials to your terminal.
+
+### Browser connectors (OAuth)
+
+`claude.ai` custom connectors and ChatGPT connectors take a URL and nothing else — there is no field for a request header, so the setup above cannot be configured there. Whenever `CLIENT_TOKEN_MODE=authorization` is set, the server also runs an OAuth 2.1 authorization server for exactly that case. Nothing extra to configure.
+
+Adding `https://your-deployment.example.com/mcp` as a custom connector then works like any other: the client discovers the metadata, registers itself, and opens a page hosted by this server that asks the user to paste their upstream API token, with the click path for generating one. The token is checked against `{GATEWAY_URL}{IDENTITY_PATH}` before it is accepted, then stored on the volume; the client only ever receives an opaque `mcp_…` grant token, which the server exchanges back into the real credential on each request.
+
+Both credentials keep working side by side — a header-configured raw token (Claude Code) and a grant token (claude.ai) are accepted on the same endpoint. If the upstream later rejects a stored token, its grant is dropped and the 401 carries the `WWW-Authenticate` challenge that sends the client back through the flow.
+
+```bash
+# who is connected
+curl -H "Authorization: Bearer $ADMIN_TOKEN" https://your-deployment.example.com/admin/grants
+
+# disconnect someone (id comes from the listing; revoking the token in the
+# upstream's own UI works too)
+curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://your-deployment.example.com/admin/grants?id=d40f97c12ddb"
+```
+
+Set `PUBLIC_URL` if a proxy in front rewrites `Host`; otherwise the metadata URLs come from the `X-Forwarded-*` headers. `SERVICE_LABEL` and `TOKEN_HELP_URL` control the wording and the link on the consent page.
 
 ### Usage stats
 

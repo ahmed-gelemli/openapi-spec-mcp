@@ -18,6 +18,16 @@ import { AsyncLocalStorage } from "async_hooks";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
+import {
+  GRANT_PREFIX,
+  handleOAuth,
+  initOAuthStore,
+  listGrants,
+  lookupGrant,
+  revokeGrant,
+  type OAuthContext,
+} from "./oauth.js";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // build/ is one level below the project root
 const PROJECT_ROOT = join(__dirname, "..");
@@ -50,6 +60,18 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "";
 // the volume, the container logs, or ADMIN_TOKEN gets working accounts for
 // every caller, revoked and current alike. Off unless deliberately enabled.
 const LOG_TOKENS = (process.env.LOG_TOKENS ?? "").toLowerCase() === "true";
+
+// Public origin of this deployment, used to build the absolute URLs in the
+// OAuth metadata documents. Derived from the proxy's forwarding headers when
+// unset, which is right in every normal deployment but wrong the moment
+// something rewrites Host — so it can be pinned.
+const PUBLIC_URL = (process.env.PUBLIC_URL ?? "").replace(/\/$/, "");
+const CANVAS_URL = (process.env.CANVAS_URL ?? "").replace(/\/$/, "");
+// Shown on the consent page, and where it sends the user to make a token.
+const SERVICE_LABEL = process.env.SERVICE_LABEL ?? (CANVAS_URL ? "Canvas" : "API");
+const TOKEN_HELP_URL =
+  process.env.TOKEN_HELP_URL ??
+  `${CANVAS_URL || (process.env.GATEWAY_URL ?? "").replace(/\/api\/?$/, "")}/profile/settings`;
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -103,9 +125,13 @@ const MISCONFIGURED_MESSAGE =
   "This server could not verify tokens against the upstream API — its GATEWAY_URL/IDENTITY_PATH " +
   "configuration is wrong. Connections are refused until that is fixed; contact whoever runs it.";
 
-const identityCache = new Map<string, Identity>();
+// Positive results are cached so an MCP request does not cost an upstream
+// round trip, but only briefly: a token revoked in the upstream's UI has to
+// stop working here without waiting for a redeploy.
+const identityCache = new Map<string, { identity: Identity; at: number }>();
 const identityRejected = new Map<string, number>();
 const REJECT_TTL_MS = 60_000;
+const IDENTITY_TTL_MS = 10 * 60_000;
 
 type IdentityResult =
   | { ok: true; identity: Identity }
@@ -120,7 +146,7 @@ async function resolveIdentity(token: string): Promise<IdentityResult> {
   const key = tokenKey(token);
 
   const cached = identityCache.get(key);
-  if (cached) return { ok: true, identity: cached };
+  if (cached && Date.now() - cached.at < IDENTITY_TTL_MS) return { ok: true, identity: cached.identity };
   const rejectedAt = identityRejected.get(key);
   if (rejectedAt !== undefined && Date.now() - rejectedAt < REJECT_TTL_MS) {
     return { ok: false, reason: `key=${key} rejected upstream (cached)`, message: REJECTED_MESSAGE };
@@ -168,7 +194,7 @@ async function resolveIdentity(token: string): Promise<IdentityResult> {
       name: (body.name ?? body.short_name ?? body.display_name) as string | undefined,
       verified: true,
     };
-    identityCache.set(key, identity);
+    identityCache.set(key, { identity, at: Date.now() });
     log(`[identity] key=${key} resolved to ${identity.id ?? "?"} (${identity.name ?? "unnamed"})${tokenSuffix(token)}`);
     return { ok: true, identity };
   } catch (e) {
@@ -1104,8 +1130,22 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, mcp-session-id",
-  "Access-Control-Expose-Headers": "mcp-session-id",
+  "Access-Control-Expose-Headers": "mcp-session-id, WWW-Authenticate",
 };
+
+// The OAuth surface exists only where callers bring their own credential;
+// in shared-token mode there is nothing for it to hand out.
+const OAUTH_ENABLED = CLIENT_TOKEN_MODE === "authorization";
+
+// Absolute origin as the client dialled it. Traefik sets the forwarding
+// headers; PUBLIC_URL overrides them when something in front rewrites Host.
+function publicBaseUrl(req: IncomingMessage): string {
+  if (PUBLIC_URL) return PUBLIC_URL;
+  const first = (v: string | string[] | undefined) => String(v ?? "").split(",")[0].trim();
+  const proto = first(req.headers["x-forwarded-proto"]) || "http";
+  const host = first(req.headers["x-forwarded-host"]) || first(req.headers.host) || `localhost:${PORT}`;
+  return `${proto}://${host}`;
+}
 
 type AuthResult =
   | { ok: true; context: CallerContext }
@@ -1124,17 +1164,50 @@ async function authorizeRequest(req: IncomingMessage): Promise<AuthResult> {
     };
   }
 
-  const token = bearerToken(req);
-  if (!token) {
+  const presented = bearerToken(req);
+  if (!presented) {
     return {
       ok: false, status: 401,
-      message: "Send your own API token as 'Authorization: Bearer <token>' — this server has no shared token.",
+      message: OAUTH_ENABLED
+        ? "Authorization required. Connect this server as an OAuth connector, or send your own API token as 'Authorization: Bearer <token>'."
+        : "Send your own API token as 'Authorization: Bearer <token>' — this server has no shared token.",
       reason: "no bearer token supplied",
     };
   }
 
+  // Two kinds of bearer are accepted. A grant token was minted by this
+  // server's OAuth flow and stands for a stored upstream credential; anything
+  // else is taken to be the upstream credential itself, which is how clients
+  // that can set a request header have always used this server.
+  let token = presented;
+  let grantId: string | undefined;
+  if (presented.startsWith(GRANT_PREFIX)) {
+    const grant = lookupGrant(presented);
+    if (!grant) {
+      return {
+        ok: false, status: 401,
+        message: "This connection was revoked or was never issued. Reconnect the connector.",
+        reason: "unknown grant token",
+      };
+    }
+    token = grant.upstream_token;
+    grantId = grant.id;
+  }
+
   const result = await resolveIdentity(token);
   if (!result.ok) {
+    // The stored credential no longer works upstream, so the grant standing
+    // for it is dead too — drop it, and the 401 sends the client back through
+    // the OAuth flow to paste a fresh token.
+    if (grantId && result.message === REJECTED_MESSAGE) {
+      revokeGrant(grantId);
+      log(`[oauth] grant=${grantId} revoked — its upstream token was rejected`);
+      return {
+        ok: false, status: 401,
+        message: "Your stored API token is no longer valid. Reconnect the connector to paste a new one.",
+        reason: `grant=${grantId} upstream token rejected`,
+      };
+    }
     return {
       ok: false,
       status: result.message === MISCONFIGURED_MESSAGE ? 503 : 401,
@@ -1166,6 +1239,10 @@ async function readBody(req: IncomingMessage): Promise<string> {
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 async function startHttpServer(): Promise<void> {
+  // Clients and grants live beside the specs and the usage log, on the volume
+  // that survives redeploys.
+  if (OAUTH_ENABLED) initOAuthStore(join(API_DIR, "oauth"));
+
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const sessionLastSeen = new Map<string, number>();
 
@@ -1201,6 +1278,72 @@ async function startHttpServer(): Promise<void> {
         log(`health → ok, services=${services.length} [${services.join(", ")}]`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, services: services.length }));
+        return;
+      }
+
+      // OAuth — discovery, registration, consent and token exchange all have
+      // to answer before any credential exists, so they sit ahead of the gate.
+      if (OAUTH_ENABLED) {
+        const oauthCtx: OAuthContext = {
+          baseUrl: publicBaseUrl(req),
+          tokenHelpUrl: TOKEN_HELP_URL,
+          serviceName: SERVICE_LABEL,
+          log,
+          verifyToken: async (token: string) => {
+            const result = await resolveIdentity(token);
+            if (!result.ok) return { ok: false as const, message: result.message };
+            // A token the upstream could not confirm must not be stored: the
+            // user would leave believing they had connected, and every later
+            // call would fail somewhere they cannot see.
+            if (!result.identity.verified) {
+              return {
+                ok: false as const,
+                message: `Could not reach ${SERVICE_LABEL} to check that token. Try again in a moment.`,
+              };
+            }
+            return { ok: true as const, id: result.identity.id, name: result.identity.name };
+          },
+        };
+        if (await handleOAuth(req, res, url, oauthCtx)) return;
+      }
+
+      // Connected accounts — same ADMIN_TOKEN gate as /usage
+      if (OAUTH_ENABLED && url.pathname === "/admin/grants") {
+        if (!ADMIN_TOKEN) {
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "ADMIN_TOKEN is not set — /admin/grants is disabled" }));
+          return;
+        }
+        if (bearerToken(req) !== ADMIN_TOKEN) {
+          log(`401 /admin/grants — bad or missing admin token`);
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+        if (req.method === "GET") {
+          const grants = listGrants();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ grants }, null, 2));
+          return;
+        }
+        if (req.method === "DELETE") {
+          const id = url.searchParams.get("id") ?? "";
+          const removed = revokeGrant(id);
+          log(`DELETE /admin/grants id=${id} — ${removed ? "revoked" : "not found"}`);
+          res.writeHead(removed ? 200 : 404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: removed, id }));
+          return;
+        }
+        res.writeHead(405, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Method Not Allowed" }));
+        return;
+      }
+
+      // Browsers ask for this on the consent page; answering here keeps it out
+      // of the auth path, where it would log a 401 on every visit.
+      if (url.pathname === "/favicon.ico") {
+        res.writeHead(204);
+        res.end();
         return;
       }
 
@@ -1240,7 +1383,16 @@ async function startHttpServer(): Promise<void> {
       const auth = await authorizeRequest(req);
       if (!auth.ok) {
         log(`${auth.status} Unauthorized — ${auth.reason}`);
-        res.writeHead(auth.status, { "Content-Type": "application/json" });
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        // RFC 9728 §5.1 — this header is what makes an OAuth-capable client
+        // start the flow instead of simply reporting a failure to the user.
+        if (OAUTH_ENABLED && auth.status === 401) {
+          const metadata = `${publicBaseUrl(req)}/.well-known/oauth-protected-resource`;
+          headers["WWW-Authenticate"] = bearerToken(req)
+            ? `Bearer error="invalid_token", error_description="${auth.message.replace(/"/g, "'")}", resource_metadata="${metadata}"`
+            : `Bearer resource_metadata="${metadata}"`;
+        }
+        res.writeHead(auth.status, headers);
         res.end(JSON.stringify({ error: auth.message }));
         return;
       }
@@ -1361,6 +1513,9 @@ async function startHttpServer(): Promise<void> {
   if (CLIENT_TOKEN_MODE === "authorization") {
     log(`Auth: per-caller — each client sends its own upstream API token as 'Authorization: Bearer <token>'`);
     log(`      tokens are verified against ${IDENTITY_PATH} and forwarded on call_endpoint; MCP_AUTH_TOKEN is ignored`);
+    log(`OAuth: enabled — browser clients connect at /oauth/authorize and paste a ${SERVICE_LABEL} token`);
+    log(`       ${listGrants().length} connected account(s); token help points at ${TOKEN_HELP_URL}`);
+    if (!PUBLIC_URL) log(`       PUBLIC_URL is not set — metadata URLs come from the X-Forwarded-* headers`);
     void checkIdentityEndpoint();
   } else {
     log(`Auth: ${AUTH_TOKEN ? "enabled (MCP_AUTH_TOKEN is set)" : "DISABLED — MCP_AUTH_TOKEN not set, all requests accepted"}`);

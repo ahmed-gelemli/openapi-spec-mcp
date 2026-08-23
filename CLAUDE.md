@@ -71,6 +71,9 @@ Copy `.env.example` to `.env`. Key variables:
 | `IDENTITY_PATH` | No | Upstream path that resolves a token to an account (default `/api/v1/users/self`) |
 | `ADMIN_TOKEN` | No | Bearer token for `GET /usage`; if unset the endpoint is disabled |
 | `LOG_TOKENS` | No | `true` records each caller's raw API token in the usage log and identity log lines |
+| `PUBLIC_URL` | No | Public origin used in the OAuth metadata documents (default: `X-Forwarded-*` headers) |
+| `SERVICE_LABEL` | No | Name on the OAuth consent page (default: `Canvas` when `CANVAS_URL` is set) |
+| `TOKEN_HELP_URL` | No | Link on the consent page for generating a token (default: `{CANVAS_URL}/profile/settings`) |
 
 ## MCP Tools
 
@@ -99,6 +102,16 @@ With `CLIENT_TOKEN_MODE=authorization`, each MCP client configures its own upstr
 - **`GET /usage`**: `ADMIN_TOKEN`-gated. Default returns a per-user rollup; `?month=YYYY-MM`, `?user=<id|key>`, `?raw=1&limit=N` for records.
 
 `CLIENT_TOKEN_MODE` defaults to `off`, which is the pre-existing behavior — both deployments share one image, so the gateway app is unaffected.
+
+## OAuth (`src/oauth.ts`)
+
+claude.ai's custom-connector UI accepts a URL and an optional OAuth client id/secret — there is no custom-header field, so the header scheme above cannot be configured there. Canvas's own OAuth2 provider needs a developer key only a Canvas admin can issue, so the server is the authorization server instead and the "login" step is a page asking the user to paste a Canvas access token. Enabled automatically whenever `CLIENT_TOKEN_MODE=authorization`; in `off` mode none of these routes exist.
+
+- **Routes**: `/.well-known/oauth-protected-resource` (RFC 9728) and `/.well-known/oauth-authorization-server` (RFC 8414, also served at `/.well-known/openid-configuration` and with a `/mcp` suffix, since clients probe both), `POST /oauth/register` (RFC 7591 — claude.ai self-registers), `GET|POST /oauth/authorize` (consent page), `POST /oauth/token`. All sit ahead of the auth gate, and a 401 on `/mcp` carries the `WWW-Authenticate: Bearer resource_metadata="…"` challenge that starts the flow.
+- **Clients are public**: no secrets issued, PKCE (`S256`) mandatory, `redirect_uri` matched exactly against what was registered, codes single-use with a 10-minute TTL. The consent form posts only an opaque `request_id`; the redirect target stays server-side so a tampered form cannot redirect the code elsewhere.
+- **Grant tokens** are prefixed `mcp_`. `authorizeRequest()` accepts either one of those (looked up to the stored Canvas token) or a raw upstream token as before, so Claude Code and claude.ai work against the same endpoint. A grant whose stored token the upstream rejects is deleted, and positive identity lookups are cached only 10 minutes so an upstream revocation takes effect without a redeploy.
+- **State**: `api/oauth/oauth.json` on the persistent volume — registered clients and grants. In-flight authorize requests and codes are in memory and are meant to be.
+- **`GET /admin/grants`** lists connected accounts (identity only, never the credentials) and `DELETE /admin/grants?id=<id>` revokes one; same `ADMIN_TOKEN` gate as `/usage`.
 
 ## Claude Desktop / Claude Code Configuration
 
