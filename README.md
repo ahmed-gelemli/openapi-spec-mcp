@@ -196,6 +196,8 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" https://your-deployment.example.com
 }
 ```
 
+To start clean, `DELETE /usage?confirm=1` removes every record, or `?month=YYYY-MM` just that month. `DELETE /admin/grants?all=1` drops every grant and registered client, after which each user reconnects. Both need `ADMIN_TOKEN`, and neither touches the container's stdout log, which rotates away with old deployments on its own.
+
 Filters: `?month=YYYY-MM`, `?user=<account id or key>`, and `?raw=1&limit=N` for individual records. With `LOG_TOKENS=true`, `?tokens=1` includes the stored token values and `?user=` also matches on a token.
 
 ## Development

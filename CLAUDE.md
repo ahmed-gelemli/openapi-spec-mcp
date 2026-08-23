@@ -98,7 +98,7 @@ With `CLIENT_TOKEN_MODE=authorization`, each MCP client configures its own upstr
 - **Identity**: `sha256(token)[:12]` is the stable key; the upstream account id and name are attached when resolvable.
 - **`LOG_TOKENS`**: off by default, in which case raw tokens stay in memory only. Set `true` and every usage record and `[identity]` log line carries the caller's live upstream credential, kept for as long as the log is (forever). `/usage` still withholds them unless `?tokens=1`, so a routine rollup does not print credentials; the file always has them.
 - **Usage log**: one JSONL record per tool call in `api/usage/YYYY-MM.jsonl` — on the same persistent volume as the specs, split monthly, never pruned. `getServices()` only matches `*-openapi.json`, so the subdirectory is invisible to it.
-- **`GET /usage`**: `ADMIN_TOKEN`-gated. Default returns a per-user rollup; `?month=YYYY-MM`, `?user=<id|key>`, `?raw=1&limit=N` for records.
+- **`GET /usage`**: `ADMIN_TOKEN`-gated. Default returns a per-user rollup; `?month=YYYY-MM`, `?user=<id|key>`, `?raw=1&limit=N` for records. `DELETE /usage?confirm=1` purges the records (optionally `&month=`); the `confirm` guard is there because the files are the only copy.
 
 `CLIENT_TOKEN_MODE` defaults to `off`, which is the pre-existing behavior — both deployments share one image, so the gateway app is unaffected.
 
@@ -110,7 +110,8 @@ claude.ai's custom-connector UI accepts a URL and an optional OAuth client id/se
 - **Clients are public**: no secrets issued, PKCE (`S256`) mandatory, `redirect_uri` matched exactly against what was registered, codes single-use with a 10-minute TTL. The consent form posts only an opaque `request_id`; the redirect target stays server-side so a tampered form cannot redirect the code elsewhere.
 - **Grant tokens** are prefixed `mcp_`. `authorizeRequest()` accepts either one of those (looked up to the stored Canvas token) or a raw upstream token as before, so Claude Code and claude.ai work against the same endpoint. A grant whose stored token the upstream rejects is deleted, and positive identity lookups are cached only 10 minutes so an upstream revocation takes effect without a redeploy.
 - **State**: `api/oauth/oauth.json` on the persistent volume — registered clients and grants. In-flight authorize requests and codes are in memory and are meant to be.
-- **`GET /admin/grants`** lists connected accounts (identity only, never the credentials) and `DELETE /admin/grants?id=<id>` revokes one; same `ADMIN_TOKEN` gate as `/usage`.
+- **`GET /admin/grants`** lists connected accounts (identity only, never the credentials), `DELETE /admin/grants?id=<id>` revokes one and `?all=1` drops every grant and client; same `ADMIN_TOKEN` gate as `/usage`.
+- **Consent page** is deliberately wordless — one field, one button. The only copy is the refusal message, since without it a mistyped token is a silent dead end. Whoever runs a deployment tells users where to make a token; the page does not.
 
 ## Claude Desktop / Claude Code Configuration
 

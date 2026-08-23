@@ -170,6 +170,16 @@ export function revokeGrant(id: string): boolean {
   return false;
 }
 
+// Drops every grant and every registered client: the server is back to the
+// state it shipped in, and every connected client has to run the flow again.
+export function revokeAllGrants(): { grants: number; clients: number } {
+  const counts = { grants: grants.size, clients: clients.size };
+  grants.clear();
+  clients.clear();
+  persist();
+  return counts;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execFile } from "child_process";
-import { readFileSync, readdirSync, existsSync, mkdirSync, appendFileSync } from "fs";
+import { readFileSync, readdirSync, existsSync, mkdirSync, appendFileSync, unlinkSync } from "fs";
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { randomUUID, createHash } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
@@ -24,6 +24,7 @@ import {
   initOAuthStore,
   listGrants,
   lookupGrant,
+  revokeAllGrants,
   revokeGrant,
   type OAuthContext,
 } from "./oauth.js";
@@ -293,6 +294,21 @@ function readUsage(month?: string): UsageRecord[] {
     }
   }
   return records;
+}
+
+// Deletes the accounting outright. The records carry raw caller credentials
+// when LOG_TOKENS is on, so being able to start clean matters more than
+// keeping a history nobody asked for.
+function purgeUsage(month?: string): string[] {
+  if (!existsSync(USAGE_DIR)) return [];
+  const removed: string[] = [];
+  for (const file of readdirSync(USAGE_DIR)) {
+    if (!file.endsWith(".jsonl")) continue;
+    if (month && file !== `${month}.jsonl`) continue;
+    unlinkSync(join(USAGE_DIR, file));
+    removed.push(file);
+  }
+  return removed;
 }
 
 type UsageSummary = {
@@ -1333,6 +1349,13 @@ async function startHttpServer(): Promise<void> {
           res.end(JSON.stringify({ grants }, null, 2));
           return;
         }
+        if (req.method === "DELETE" && url.searchParams.get("all") === "1") {
+          const counts = revokeAllGrants();
+          log(`DELETE /admin/grants?all=1 — dropped ${counts.grants} grant(s) and ${counts.clients} client(s)`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, ...counts }));
+          return;
+        }
         if (req.method === "DELETE") {
           const id = url.searchParams.get("id") ?? "";
           const removed = revokeGrant(id);
@@ -1355,7 +1378,7 @@ async function startHttpServer(): Promise<void> {
       }
 
       // Usage stats — gated by ADMIN_TOKEN, never by a caller's own token
-      if (req.method === "GET" && url.pathname === "/usage") {
+      if ((req.method === "GET" || req.method === "DELETE") && url.pathname === "/usage") {
         if (!ADMIN_TOKEN) {
           res.writeHead(503, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "ADMIN_TOKEN is not set — /usage is disabled" }));
@@ -1369,6 +1392,20 @@ async function startHttpServer(): Promise<void> {
         }
 
         const month = url.searchParams.get("month") ?? undefined;
+
+        if (req.method === "DELETE") {
+          if (url.searchParams.get("confirm") !== "1") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Add ?confirm=1 — this deletes usage records permanently" }));
+            return;
+          }
+          const removed = purgeUsage(month);
+          log(`DELETE /usage — removed ${removed.length} file(s): [${removed.join(", ")}]`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, removed }));
+          return;
+        }
+
         const user = url.searchParams.get("user");
         const includeTokens = url.searchParams.get("tokens") === "1";
         let records = readUsage(month);
