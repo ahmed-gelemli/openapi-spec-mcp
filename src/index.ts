@@ -67,11 +67,8 @@ const LOG_TOKENS = (process.env.LOG_TOKENS ?? "").toLowerCase() === "true";
 // something rewrites Host — so it can be pinned.
 const PUBLIC_URL = (process.env.PUBLIC_URL ?? "").replace(/\/$/, "");
 const CANVAS_URL = (process.env.CANVAS_URL ?? "").replace(/\/$/, "");
-// Shown on the consent page, and where it sends the user to make a token.
+// Names the upstream in the one message the consent page can show.
 const SERVICE_LABEL = process.env.SERVICE_LABEL ?? (CANVAS_URL ? "Canvas" : "API");
-const TOKEN_HELP_URL =
-  process.env.TOKEN_HELP_URL ??
-  `${CANVAS_URL || (process.env.GATEWAY_URL ?? "").replace(/\/api\/?$/, "")}/profile/settings`;
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -1286,7 +1283,6 @@ async function startHttpServer(): Promise<void> {
       if (OAUTH_ENABLED) {
         const oauthCtx: OAuthContext = {
           baseUrl: publicBaseUrl(req),
-          tokenHelpUrl: TOKEN_HELP_URL,
           serviceName: SERVICE_LABEL,
           log,
           verifyToken: async (token: string) => {
@@ -1525,7 +1521,7 @@ async function startHttpServer(): Promise<void> {
     log(`Auth: per-caller — each client sends its own upstream API token as 'Authorization: Bearer <token>'`);
     log(`      tokens are verified against ${IDENTITY_PATH} and forwarded on call_endpoint; MCP_AUTH_TOKEN is ignored`);
     log(`OAuth: enabled — browser clients connect at /oauth/authorize and paste a ${SERVICE_LABEL} token`);
-    log(`       ${listGrants().length} connected account(s); token help points at ${TOKEN_HELP_URL}`);
+    log(`       ${listGrants().length} connected account(s)`);
     if (!PUBLIC_URL) log(`       PUBLIC_URL is not set — metadata URLs come from the X-Forwarded-* headers`);
     void checkIdentityEndpoint();
   } else {

@@ -72,8 +72,7 @@ Copy `.env.example` to `.env`. Key variables:
 | `ADMIN_TOKEN` | No | Bearer token for `GET /usage`; if unset the endpoint is disabled |
 | `LOG_TOKENS` | No | `true` records each caller's raw API token in the usage log and identity log lines |
 | `PUBLIC_URL` | No | Public origin used in the OAuth metadata documents (default: `X-Forwarded-*` headers) |
-| `SERVICE_LABEL` | No | Name on the OAuth consent page (default: `Canvas` when `CANVAS_URL` is set) |
-| `TOKEN_HELP_URL` | No | Link on the consent page for generating a token (default: `{CANVAS_URL}/profile/settings`) |
+| `SERVICE_LABEL` | No | Names the upstream in the consent page's error message (default: `Canvas` when `CANVAS_URL` is set) |
 
 ## MCP Tools
 

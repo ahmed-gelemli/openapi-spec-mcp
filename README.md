@@ -60,8 +60,7 @@ cp .env.example .env
 | `IDENTITY_PATH` | No | Upstream path resolving a token to an account (default `/api/v1/users/self`) |
 | `ADMIN_TOKEN` | No | Bearer token for `GET /usage` and `/admin/grants`; if unset both are disabled |
 | `PUBLIC_URL` | No | Public origin used in the OAuth metadata; defaults to the `X-Forwarded-*` headers |
-| `SERVICE_LABEL` | No | Name shown on the OAuth consent page (defaults to `Canvas` when `CANVAS_URL` is set) |
-| `TOKEN_HELP_URL` | No | Where the consent page tells users to generate a token |
+| `SERVICE_LABEL` | No | Names the upstream in the consent page's error message (defaults to `Canvas` when `CANVAS_URL` is set) |
 | `LOG_TOKENS` | No | `true` records callers' raw API tokens in the usage log — see [Per-user tokens](#per-user-tokens) |
 | `API_BEARER_TOKEN` | No | Token sent on `call_endpoint` when the caller supplies none |
 | `GATEWAY_URL` | Yes (for downloads) | Base URL of your API gateway |
@@ -171,7 +170,7 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
   "https://your-deployment.example.com/admin/grants?id=d40f97c12ddb"
 ```
 
-Set `PUBLIC_URL` if a proxy in front rewrites `Host`; otherwise the metadata URLs come from the `X-Forwarded-*` headers. `SERVICE_LABEL` and `TOKEN_HELP_URL` control the wording and the link on the consent page.
+The consent page is deliberately bare — one field and a button, no instructions — so tell users where to generate a token yourself. `SERVICE_LABEL` names the upstream in the one message it can show, when a token is refused. Set `PUBLIC_URL` if a proxy in front rewrites `Host`; otherwise the metadata URLs come from the `X-Forwarded-*` headers.
 
 ### Usage stats
 

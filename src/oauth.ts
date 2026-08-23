@@ -83,8 +83,6 @@ export type OAuthContext = {
   baseUrl: string;
   // Resolves a pasted upstream token to an account, or explains why it cannot.
   verifyToken: (token: string) => Promise<VerifyResult>;
-  // Where the user goes to generate that token.
-  tokenHelpUrl: string;
   // Shown on the consent page: "Connect your Canvas account".
   serviceName: string;
   log: (msg: string) => void;
@@ -245,7 +243,7 @@ function errorPage(res: ServerResponse, status: number, title: string, detail: s
 // Consent page
 // ---------------------------------------------------------------------------
 
-function page(main: string): string {
+function page(main: string, mainClass = ""): string {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -272,6 +270,7 @@ function page(main: string): string {
     -webkit-font-smoothing: antialiased;
   }
   main { max-width: 34rem; margin: 0 auto; }
+  main.solo { max-width: 24rem; min-height: calc(100vh - 5rem); display: flex; flex-direction: column; justify-content: center; }
   h1 { font-size: 1.4rem; line-height: 1.25; margin: 0 0 .4rem; letter-spacing: -.01em; }
   p { margin: 0 0 1rem; }
   .muted { color: var(--muted); font-size: .925rem; }
@@ -301,52 +300,26 @@ function page(main: string): string {
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
 </style>
 </head>
-<body><main>
+<body><main${mainClass ? ` class="${mainClass}"` : ""}>
 ${main}
 </main></body>
 </html>`;
 }
 
-function consentPage(opts: {
-  requestId: string;
-  serviceName: string;
-  tokenHelpUrl: string;
-  clientName: string;
-  error?: string;
-}): string {
-  const { requestId, serviceName, tokenHelpUrl, clientName, error } = opts;
+// Deliberately wordless: a field and a button, nothing to read. The only text
+// that ever appears is the failure message — without it a mistyped token is a
+// dead end with no way to tell.
+function consentPage(requestId: string, error?: string): string {
   return page(`
-  <h1>Connect your ${escapeHtml(serviceName)} account</h1>
-  <p class="muted">
-    <strong>${escapeHtml(clientName)}</strong> is asking to use the ${escapeHtml(serviceName)} API as you.
-    It will act with your permissions and see only what you can see.
-  </p>
-
-  <ol>
-    <li>Open <a href="${escapeHtml(tokenHelpUrl)}" target="_blank" rel="noopener">your ${escapeHtml(serviceName)} settings</a>.</li>
-    <li>Scroll to <strong>Approved Integrations</strong> and click <strong>+ New Access Token</strong>.</li>
-    <li>Give it any purpose (e.g. <em>Claude</em>), leave the expiry blank, and click <strong>Generate Token</strong>.</li>
-    <li>Copy the token — ${escapeHtml(serviceName)} shows it once — and paste it below.</li>
-  </ol>
-
-  <div class="card">
+  <form method="POST" action="/oauth/authorize" autocomplete="off">
     ${error ? `<div class="error">${escapeHtml(error)}</div>` : ""}
-    <form method="POST" action="/oauth/authorize" autocomplete="off">
-      <input type="hidden" name="request_id" value="${escapeHtml(requestId)}">
-      <label for="token">Access token</label>
-      <input id="token" name="token" type="password" required autofocus
-             placeholder="1234~aBcDeF…" spellcheck="false" autocapitalize="off"
-             autocomplete="new-password">
-      <button type="submit">Connect</button>
-    </form>
-  </div>
-
-  <p class="foot">
-    Your token is stored on this server so it can make ${escapeHtml(serviceName)} calls on your behalf.
-    It is never given to ${escapeHtml(clientName)}. Revoke it any time from
-    <strong>Approved Integrations</strong> in ${escapeHtml(serviceName)}.
-  </p>
-  `);
+    <input type="hidden" name="request_id" value="${escapeHtml(requestId)}">
+    <input id="token" name="token" type="password" required autofocus
+           spellcheck="false" autocapitalize="off" autocomplete="new-password"
+           aria-label="Access token">
+    <button type="submit">Connect</button>
+  </form>
+  `, "solo");
 }
 
 // ---------------------------------------------------------------------------
@@ -522,12 +495,7 @@ function handleAuthorizeGet(res: ServerResponse, url: URL, ctx: OAuthContext): b
   html(
     res,
     200,
-    consentPage({
-      requestId,
-      serviceName: ctx.serviceName,
-      tokenHelpUrl: ctx.tokenHelpUrl,
-      clientName: client.client_name ?? "An application",
-    }),
+    consentPage(requestId),
   );
   return true;
 }
@@ -555,21 +523,12 @@ async function handleAuthorizePost(
     errorPage(res, 400, "This page expired", "Go back to the application and start the connection again.");
     return true;
   }
-  const client = clients.get(request.client_id);
-  const clientName = client?.client_name ?? "An application";
-
   const token = (form.get("token") ?? "").trim();
   const reject = (message: string) =>
     html(
       res,
       400,
-      consentPage({
-        requestId,
-        serviceName: ctx.serviceName,
-        tokenHelpUrl: ctx.tokenHelpUrl,
-        clientName,
-        error: message,
-      }),
+      consentPage(requestId, message),
     );
 
   if (!token) {
