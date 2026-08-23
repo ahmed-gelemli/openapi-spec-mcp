@@ -1291,7 +1291,18 @@ async function startHttpServer(): Promise<void> {
           log,
           verifyToken: async (token: string) => {
             const result = await resolveIdentity(token);
-            if (!result.ok) return { ok: false as const, message: result.message };
+            if (!result.ok) {
+              // The stock message is written for an MCP client's error log;
+              // on this page it is read by someone who has just pasted
+              // something into a box and needs to know what to do next.
+              return {
+                ok: false as const,
+                message:
+                  result.message === REJECTED_MESSAGE
+                    ? `${SERVICE_LABEL} did not accept that token. Copy it again — it may be incomplete, or it may have been deleted.`
+                    : result.message,
+              };
+            }
             // A token the upstream could not confirm must not be stored: the
             // user would leave believing they had connected, and every later
             // call would fail somewhere they cannot see.
